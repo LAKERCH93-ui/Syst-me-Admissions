@@ -1,0 +1,5736 @@
+/**
+ * BACKEND CENTRALISÉ DES ADMISSIONS
+ * Google Apps Script V11 — DOUBLE MODÈLE NATIONAL / INTERNATIONAL
+ *
+ * Fonctionnalités :
+ * 1. Routage vers 8 Google Sheets : 4 campus × 2 flux.
+ * 2. Le campus est lu directement depuis le formulaire.
+ * 3. France = NATIONAL ; hors de France = INTERNATIONAL.
+ * 3. Réception HTTP JSON avec doPost(e).
+ * 4. Injection interne avec enregistrerCandidatInterne(donneesEtudiant).
+ * 5. Utilisation stricte des onglets, colonnes et lignes déjà existants.
+ * 6. Contrôle des doublons par adresse e-mail.
+ * 7. Tests de routage et test complet d'écriture.
+ * 8. Flux NATIONAL : modèle Google Docs national, OTP par e-mail, signature manuscrite et archivage.
+ * 9. Flux INTERNATIONAL : génération PDF et envoi direct par e-mail, sans prestataire externe.
+ * 10. Une seule URL /exec pour les formulaires et le portail de signature.
+ *
+ * IMPORTANT POUR LE FRONTEND :
+ * Envoyer le JSON avec :
+ * Content-Type: text/plain;charset=utf-8
+ *
+ * Exemple :
+ * fetch(URL_APPS_SCRIPT, {
+ *   method: "POST",
+ *   headers: { "Content-Type": "text/plain;charset=utf-8" },
+ *   body: JSON.stringify(donnees)
+ * });
+ */
+
+// ============================================================================
+// 1. MATRICE DE ROUTAGE : CAMPUS × TYPE DE FLUX
+// ============================================================================
+
+const ROUTEUR_SHEETS = Object.freeze({
+  /**
+   * HUIT DESTINATIONS UNIQUES :
+   *
+   * TORCY + France       -> TORCY / NATIONAL
+   * TORCY + hors France  -> TORCY / INTERNATIONAL
+   *
+   * EVRY + France        -> EVRY / NATIONAL
+   * EVRY + hors France   -> EVRY / INTERNATIONAL
+   *
+   * LYON + France        -> LYON / NATIONAL
+   * LYON + hors France   -> LYON / INTERNATIONAL
+   */
+
+  TORCY: Object.freeze({
+    NATIONAL: "1cNMbrqTxUByKvcoOaPoX4lmjWxncgB6Kxynvnu7TnYU",
+    INTERNATIONAL: "1w3DzNKrXPDoGTHHULlgvgqRBYZRdu95jTJ5ImesFEVg"
+  }),
+
+  EVRY: Object.freeze({
+    NATIONAL: "1C0ZuOWmW9SI-ir3J87t0LKoclb5sxDfCfGjznK0EEK0",
+    INTERNATIONAL: "1gttoNM46vIdi6rIKxAKXzXf2cyOREy7EYghP9SxH_L4"
+  }),
+
+  LYON: Object.freeze({
+    NATIONAL: "1fCLumMBX5Rng-_0h9ZWV-bM605LKiMHLWigAtMaOZkU",
+    INTERNATIONAL: "1St0WybJEXsruzpt8GzbEtye648BD6B2f842X-nykgqc"
+  }),
+
+  NOISIEL: Object.freeze({
+    NATIONAL: "1ogz8ij7w-VIO7tXyfdNJZlcBDvDUfkESR1uNiWlv08Q",
+    INTERNATIONAL: "1qrZC7cbNdCaE4q7lrL_8sPBx59xPzJw_oohXfkhCPP4"
+  })
+});
+
+// ============================================================================
+// 2. CONFIGURATION DES ÉCOLES
+// ============================================================================
+
+const CONFIG = Object.freeze({
+  VERSION: "11.0.0 - DOUBLE MODÈLE + SIGNATURE INTERNE",
+  FUSEAU_HORAIRE: "Europe/Paris",
+  BLOQUER_DOUBLONS_EMAIL: true,
+  CONSERVER_DOCUMENT_GOOGLE: true,
+  AUTORISER_VALIDATION_DOSSIER_INCOMPLET: false,
+  ADMIN_EMAIL: "",
+  OBJET_EMAIL_ADMISSION: "Félicitations ! Votre admission est confirmée 🎉",
+  VIDEO_RNCP_URL: "https://youtu.be/5PRxfts4Rj8",
+  WHATSAPP_ADMISSIONS: Object.freeze([
+    "+33 (0)7 66 74 93 35",
+    "+33 (0)6 95 85 70 85"
+  ]),
+  OBJET_EMAIL_PIECES_MANQUANTES: "[{{ECOLE}}] Votre dossier de candidature est incomplet",
+
+
+  /**
+   * SIGNATURE INTERNE — FLUX NATIONAL
+   *
+   * Aucun prestataire externe de signature n'est utilisé.
+   * Le candidat reçoit :
+   * - la lettre PDF en pièce jointe ;
+   * - un lien privé vers le portail de signature ;
+   * - un code OTP envoyé séparément par e-mail.
+   *
+   * Le système conserve :
+   * - le consentement ;
+   * - la signature manuscrite ;
+   * - la date et l'heure ;
+   * - le navigateur déclaré ;
+   * - les empreintes SHA-256 des PDF original et signé ;
+   * - un dossier de preuve PDF + JSON.
+   *
+   * IMPORTANT : cette solution n'est pas une signature qualifiée eIDAS.
+   */
+  SIGNATURE_INTERNE: Object.freeze({
+    ACTIVE: true,
+    VALIDITE_LIEN_JOURS: 15,
+    VALIDITE_OTP_MINUTES: 10,
+    MAX_TENTATIVES_OTP: 5,
+    DELAI_RENVOI_OTP_SECONDES: 60,
+    TAILLE_MAX_SIGNATURE_OCTETS: 700000,
+    NOM_FICHIER_HTML: "SignatureEtudiant",
+    CONSENTEMENT_TEXTE:
+      "Je confirme avoir lu la lettre d'admission et j'accepte de la signer électroniquement. " +
+      "Je reconnais que ma signature manuscrite, le code reçu par e-mail, la date et les empreintes du document seront conservés comme éléments de preuve."
+  }),
+
+  PIECES_OBLIGATOIRES: Object.freeze({
+    NATIONAL: Object.freeze(["CV", "DIPLOME", "PIECE_IDENTITE", "CARTE_VITALE"]),
+    INTERNATIONAL: Object.freeze(["CV", "DIPLOME", "PIECE_IDENTITE"])
+  }),
+
+  LIBELLES_PIECES: Object.freeze({
+    CV: "Curriculum Vitae (CV)",
+    DIPLOME: "Dernier diplôme ou relevé de notes",
+    PIECE_IDENTITE: "Pièce d'identité, passeport ou titre de séjour",
+    CARTE_VITALE: "Carte Vitale",
+    JUSTIFICATIF_HANDICAP: "Justificatif de situation de handicap"
+  }),
+
+  /**
+   * RESSOURCES PAR ÉCOLE ET PAR FLUX.
+   *
+   * TEMPLATE_NATIONAL_ID : modèle Google Docs réservé aux admissions nationales.
+   * TEMPLATE_INTERNATIONAL_ID : modèle Google Docs réservé aux admissions internationales.
+   * DOSSIER_DRIVE_ID : dossier racine commun utilisé par défaut.
+   * DOSSIER_DRIVE_NATIONAL_ID / INTERNATIONAL_ID : dossiers spécifiques facultatifs.
+   *
+   * Les anciens modèles existants ont été conservés comme modèles NATIONAUX.
+   * Renseignez les identifiants des nouveaux modèles INTERNATIONAUX.
+   */
+  RESSOURCES_ECOLES: Object.freeze({
+    "ISMOD": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1B5_4K8JP4-v15EjKchG7_cpIg_eerEZGYWUWk6jrStU",
+      TEMPLATE_INTERNATIONAL_ID: "1Im6rUEsGvXtwmZSEOPxXjOVZpdzyZyXW9tkHrMMT_hY",
+      DOSSIER_DRIVE_ID: "1Jh3v0MWzIr_pDM43dEHpQzrUjWabA70F",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ISMOD",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ILMIS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1gq6A_jf4MTsWY3ofiLDjH-znWad00zgWT6lFOqDCUdY",
+      TEMPLATE_INTERNATIONAL_ID: "1sD_ytHqsKmbWdiTLNlutGJ0gG-6W2I-_4alSTscaV3w",
+      DOSSIER_DRIVE_ID: "1zFuvoMNxrGrzYDLAZ5d4MQHUidq2NDM4",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ILMIS",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "DCG FORMATIONS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1Xn2YDYNQGdhFt3f1N5zPXMPj2BhUhHKlwGTPUGuuVOY",
+      TEMPLATE_INTERNATIONAL_ID: "1pGog9ioIA2yGZqhbqDtsFQYMxeJlYpBEP1J9lzzmEsE",
+      DOSSIER_DRIVE_ID: "15GduIivZ-Vm_BLsT6qDiTuyZlGBSwb8I",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions DCG Formations",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESIIA": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1tTmS3u3uGP3Rgu4xDLaXZw1mof4L3m0vG6DuRryUW1M",
+      TEMPLATE_INTERNATIONAL_ID: "14R0y3isAxUFQPHFixaisp8IsDOAO0dXxC2wmVBVMfu4",
+      DOSSIER_DRIVE_ID: "1tYJJYdwZvrYFN8DG06y2ybnCnGu-4lj3",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESIIA",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESMEP": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1TAfDqT2spJGQbO3Dh2T-c8ZgZRwDwSkhj07PCoeBBKg",
+      TEMPLATE_INTERNATIONAL_ID: "11UDWhda-aUp0eSAudxkixusRXCkVqS7JpGnlBt9V9Q4",
+      DOSSIER_DRIVE_ID: "18eR6agQ3PslPa76EPFByZFXfiTisAnSt",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESMEP",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "EMSP": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1j3dT3e87xZgW80jsKWpASciGouGBVARjqTuWXbCmNOE",
+      TEMPLATE_INTERNATIONAL_ID: "1T4AAH5G6UudmVZ6Oe-EaOEsulD5orOMop1MXBiPwhv0",
+      DOSSIER_DRIVE_ID: "1FIeVZmjCmmzPHqUIXE7W_FXH3EEzR4Wv",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions EMSP",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "LSB": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1dKmOeTvved27p-6vmVgbxsYjLcrRIfvfqSDgyNJ_UvE",
+      TEMPLATE_INTERNATIONAL_ID: "1cJf7qDWADyo2LlylOb-1rjomnuLdREbRk6guqkVEWYA",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions LSB",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESUV": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1pEdd7_JarhfK2bOoPdsZd6agP015BhUn0LVnyzBopHA",
+      TEMPLATE_INTERNATIONAL_ID: "1Mgu7Cli5sP1T6SbZr5V_eTQIMJQeZI2bOpAudnov4MI",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESUV",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESEA": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1FmIt4XhgkmQj4xOJdpzcYOeoYztH9hRdG8Czx46KDDI",
+      TEMPLATE_INTERNATIONAL_ID: "16TsfqnY549oAjtChWjVuIwD61n0pB1I_uPNj0Rqnwoc",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESEA",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "MLV BS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "A_CONFIGURER",
+      TEMPLATE_INTERNATIONAL_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions MLV BS",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "MLV BTS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "A_CONFIGURER",
+      TEMPLATE_INTERNATIONAL_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions MLV BTS",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESMOSS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "A_CONFIGURER",
+      TEMPLATE_INTERNATIONAL_ID: "1cmn4Z4zxFvYgkaq4Grv2zs8y7WX9rduvKsQ_OcdIal4",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESMOSS",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESMAS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "17e-g_7npGMAh4ETCNYlG37BwEm8WOl-H_AconPnbjus",
+      TEMPLATE_INTERNATIONAL_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESMAS",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESART": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1iNTgENPBcIs7nXB_d75bL5TY1tz-eiyAFrArT5knQYE",
+      TEMPLATE_INTERNATIONAL_ID: "1jgM9uf7WAGLaImmATL8b666jhk7xtIzVl7TQbBGWcjk",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESART",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "CESCOM": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1Tf6XYUcW3BWF4gYcqicK6kFxg9r58hsKiYH4liautR0",
+      TEMPLATE_INTERNATIONAL_ID: "1ODPgd2QdlRqHH7inROaIDM-TqAvNom3c7eXXWrYvAm4",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions CESCOM",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESJM": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "16BTpkFEJ4P54JgTtJZ20Gd9o9S1ssbgep_9G9z_PPrs",
+      TEMPLATE_INTERNATIONAL_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESJM",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "EVRY BS": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "A_CONFIGURER",
+      TEMPLATE_INTERNATIONAL_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_ID: "A_CONFIGURER",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions EVRY BS",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    }),
+    "ESETH": Object.freeze({
+      TEMPLATE_NATIONAL_ID: "1P06yLB3BhjMnLqrx2ooHBUOD2C8hPVgNZSmSoY1iwX8",
+      TEMPLATE_INTERNATIONAL_ID: "1Nrss4V9txqtMxVg5nLYXEkiuWCiPa_3iA-jc1GIu2XQ",
+      DOSSIER_DRIVE_ID: "1824m16kuZkA3ANCV5cdDfe6b8qgoozac",
+      DOSSIER_DRIVE_NATIONAL_ID: "",
+      DOSSIER_DRIVE_INTERNATIONAL_ID: "",
+      NOM_EXPEDITEUR: "Admissions ESETH",
+      NOM_EXPEDITEUR_NATIONAL: "",
+      NOM_EXPEDITEUR_INTERNATIONAL: "",
+      REPLY_TO: "",
+      REPLY_TO_NATIONAL: "",
+      REPLY_TO_INTERNATIONAL: ""
+    })
+  }),
+
+  /**
+   * Pour activer une clé d'API :
+   * 1. Passer EXIGER_CLE_API à true.
+   * 2. Dans Apps Script : Paramètres du projet > Propriétés du script.
+   * 3. Ajouter ADMISSIONS_API_KEY avec une valeur secrète.
+   * 4. Envoyer api_key dans le JSON.
+   */
+  EXIGER_CLE_API: false,
+
+  /**
+   * Les écoles traitées par ces formulaires sont multi-campus.
+   * Le backend utilise directement le champ `campus` reçu du formulaire.
+   * Il ne redemande jamais le campus dans Google Sheets.
+   */
+  ECOLES_MONO_CAMPUS: Object.freeze({
+    LSB: Object.freeze({ CAMPUS_FIXE: "LYON" }),
+    ESUV: Object.freeze({ CAMPUS_FIXE: "LYON" }),
+    ESEA: Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    "MLV BS": Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    "MLV BTS": Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    ESMOSS: Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    ESMAS: Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    ESART: Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    CESCOM: Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    ESJM: Object.freeze({ CAMPUS_FIXE: "NOISIEL" }),
+    "EVRY BS": Object.freeze({ CAMPUS_FIXE: "EVRY" }),
+    ESETH: Object.freeze({ CAMPUS_FIXE: "EVRY" })
+  }),
+
+  ECOLES_MULTI_CAMPUS: Object.freeze({
+    ISMOD: Object.freeze({
+      CAMPUS_AUTORISES: ["TORCY", "EVRY", "LYON"]
+    }),
+    ILMIS: Object.freeze({
+      CAMPUS_AUTORISES: ["TORCY", "EVRY", "LYON"]
+    }),
+    "DCG FORMATIONS": Object.freeze({
+      CAMPUS_AUTORISES: ["TORCY", "EVRY", "LYON"]
+    }),
+    ESIIA: Object.freeze({
+      CAMPUS_AUTORISES: ["TORCY", "EVRY", "LYON"]
+    }),
+    ESMEP: Object.freeze({
+      CAMPUS_AUTORISES: ["TORCY", "EVRY", "LYON"]
+    }),
+    EMSP: Object.freeze({
+      CAMPUS_AUTORISES: ["TORCY", "EVRY", "LYON"]
+    })
+  }),
+
+  ALIASES_ECOLES: Object.freeze({
+    "DCG": "DCG FORMATIONS",
+    "DCG FORMATION": "DCG FORMATIONS",
+    "ESIA": "ESIIA",
+    "ISMODE": "ISMOD",
+    "ESMASS": "ESMAS",
+    "ESMAS": "ESMAS",
+    "MLV-BS": "MLV BS",
+    "MLV BUSINESS SCHOOL": "MLV BS",
+    "MARNE LA VALLEE BUSINESS SCHOOL": "MLV BS",
+    "MARNE-LA-VALLEE BUSINESS SCHOOL": "MLV BS",
+    "MARNE LA VALLEE BTS": "MLV BTS",
+    "EVRY BUSINESS SCHOOL": "EVRY BS"
+  })
+});
+
+// ============================================================================
+// 3. COLONNES ET ALIASES D'EN-TÊTES
+// ============================================================================
+
+const CHAMPS = Object.freeze([
+  {
+    cle: "date_soumission",
+    titre: "DATE DE SOUMISSION",
+    aliases: ["date de soumission", "date soumission", "horodatage", "timestamp"]
+  },
+  {
+    cle: "reference_dossier",
+    titre: "REFERENCE DU DOSSIER",
+    aliases: ["reference du dossier", "référence du dossier", "reference dossier", "numero dossier"]
+  },
+  {
+    cle: "source",
+    titre: "SOURCE",
+    aliases: ["source", "origine de saisie"]
+  },
+  {
+    cle: "type_admission",
+    titre: "TYPE ADMISSION",
+    aliases: ["type admission", "flux", "national international"]
+  },
+  {
+    cle: "ecole",
+    titre: "ECOLE",
+    aliases: ["ecole", "école", "etablissement", "établissement"]
+  },
+  {
+    cle: "campus",
+    titre: "CAMPUS",
+    aliases: ["campus", "site"]
+  },
+  {
+    cle: "nom_complet",
+    titre: "NOM COMPLET",
+    aliases: ["nom complet", "nom et prenoms", "nom et prénoms", "nom prenoms"]
+  },
+  {
+    cle: "nom",
+    titre: "NOM",
+    aliases: ["nom", "nom de famille"]
+  },
+  {
+    cle: "prenom",
+    titre: "PRENOM",
+    aliases: ["prenom", "prénom", "prenoms", "prénoms"]
+  },
+  {
+    cle: "date_naissance",
+    titre: "DATE DE NAISSANCE",
+    aliases: ["date de naissance", "date de n", "ddn"]
+  },
+  {
+    cle: "lieu_naissance",
+    titre: "LIEU DE NAISSANCE",
+    aliases: ["lieu de naissance", "ldn"]
+  },
+  {
+    cle: "pays_residence",
+    titre: "PAYS DE RESIDENCE ACTUEL",
+    aliases: ["pays de residence actuel", "pays de résidence actuel", "pays residence", "pays"]
+  },
+  {
+    cle: "ville",
+    titre: "VILLE",
+    aliases: ["ville", "ville de residence", "ville de résidence"]
+  },
+  {
+    cle: "adresse",
+    titre: "ADRESSE",
+    aliases: ["adresse", "adresse postale"]
+  },
+  {
+    cle: "telephone",
+    titre: "NUMERO DE TELEPHONE",
+    aliases: ["numero de telephone", "numéro de téléphone", "telephone", "téléphone"]
+  },
+  {
+    cle: "telephone_proche",
+    titre: "TELEPHONE DU PROCHE",
+    aliases: ["telephone du proche", "téléphone du proche", "numero proche", "urgence"]
+  },
+  {
+    cle: "email",
+    titre: "ADRESSE EMAIL",
+    aliases: ["adresse email", "email", "e-mail", "courriel"]
+  },
+  {
+    cle: "cycle",
+    titre: "CYCLE",
+    aliases: ["cycle", "type de cycle"]
+  },
+  {
+    cle: "niveau_academique",
+    titre: "NIVEAU ACADEMIQUE",
+    aliases: ["niveau academique", "niveau académique", "niveau d'etude", "niveau d’étude", "niveau"]
+  },
+  {
+    cle: "domaine",
+    titre: "DOMAINE",
+    aliases: ["domaine", "domaine d'etude", "domaine d’étude", "specialite", "spécialité"]
+  },
+  {
+    cle: "formation",
+    titre: "FORMATION",
+    aliases: ["formation", "programme"]
+  },
+  {
+    cle: "code_rncp",
+    titre: "CODE RNCP",
+    aliases: ["code rncp", "rncp", "numero rncp", "numéro rncp"]
+  },
+  {
+    cle: "rythme",
+    titre: "RYTHME",
+    aliases: ["rythme", "rythme academique", "rythme académique", "modalite", "modalité"]
+  },
+  {
+    cle: "financement",
+    titre: "FINANCEMENT",
+    aliases: ["financement", "mode de financement"]
+  },
+  {
+    cle: "handicap",
+    titre: "SITUATION DE HANDICAP",
+    aliases: ["situation de handicap", "situation d'handicape", "handicap"]
+  },
+  {
+    cle: "motif_non_conformite",
+    titre: "MOTIF DE NON CONFORMITE",
+    aliases: ["motif de non conformite", "motif de non-conformité", "motif", "commentaire dossier"]
+  },
+  {
+    cle: "pieces_manquantes",
+    titre: "PIECES MANQUANTES",
+    aliases: ["pieces manquantes", "pièces manquantes", "documents manquants"]
+  },
+  {
+    cle: "lien_cv",
+    titre: "LIEN CV",
+    aliases: ["lien cv", "cv"]
+  },
+  {
+    cle: "lien_diplome",
+    titre: "LIEN DIPLOME",
+    aliases: ["lien diplome", "lien diplôme", "diplome", "diplôme"]
+  },
+  {
+    cle: "lien_piece_identite",
+    titre: "LIEN PIECE D'IDENTITE",
+    aliases: ["lien piece d'identite", "lien pièce d'identité", "lien piece d'idente", "piece d'identite"]
+  },
+  {
+    cle: "lien_carte_vitale",
+    titre: "LIEN CARTE VITALE",
+    aliases: ["lien carte vitale", "carte vital", "carte vitale"]
+  },
+  {
+    cle: "lien_justificatif_handicap",
+    titre: "LIEN JUSTIFICATIF HANDICAP",
+    aliases: ["lien justificatif handicap", "lien preuve de situation handicape", "rqth"]
+  },
+  {
+    cle: "lien_pdf_lettre",
+    titre: "LIEN PDF POUR LA LETTRE",
+    aliases: ["lien pdf pour la lettre", "lien pdf de lettre", "pdf lettre", "lettre admission"]
+  },
+  {
+    cle: "date_decision",
+    titre: "DATE DE DECISION",
+    aliases: ["date de decision", "date de décision", "date validation"]
+  },
+  {
+    cle: "date_email",
+    titre: "DATE D'ENVOI DU MAIL",
+    aliases: ["date d'envoi du mail", "date email", "mail envoyé le"]
+  },
+  {
+    cle: "valide_par",
+    titre: "VALIDE PAR",
+    aliases: ["valide par", "validé par", "responsable validation"]
+  },
+  {
+    cle: "statut",
+    titre: "STATUT",
+    aliases: ["statut", "status"]
+  },
+  {
+    cle: "statut_signature",
+    titre: "STATUT SIGNATURE",
+    aliases: ["statut signature", "signature statut", "etat signature", "état signature"]
+  },
+  {
+    cle: "id_demande_signature",
+    titre: "ID DEMANDE SIGNATURE",
+    aliases: ["id demande signature", "identifiant demande signature"]
+  },
+  {
+    cle: "id_document_signature",
+    titre: "ID DOCUMENT SIGNATURE",
+    aliases: ["id document signature", "id google docs lettre"]
+  },
+  {
+    cle: "id_signataire",
+    titre: "ID SIGNATAIRE",
+    aliases: ["id signataire", "identifiant signataire"]
+  },
+  {
+    cle: "id_fichier_pdf_original",
+    titre: "ID FICHIER PDF ORIGINAL",
+    aliases: ["id fichier pdf original", "id pdf original"]
+  },
+  {
+    cle: "date_envoi_signature",
+    titre: "DATE ENVOI SIGNATURE",
+    aliases: ["date envoi signature", "date d'envoi signature"]
+  },
+  {
+    cle: "date_signature",
+    titre: "DATE SIGNATURE",
+    aliases: ["date signature", "signé le", "date de signature"]
+  },
+  {
+    cle: "date_consultation_signature",
+    titre: "DATE CONSULTATION SIGNATURE",
+    aliases: ["date consultation signature", "date ouverture signature"]
+  },
+  {
+    cle: "expiration_signature",
+    titre: "EXPIRATION SIGNATURE",
+    aliases: ["expiration signature", "date expiration signature"]
+  },
+  {
+    cle: "lien_signature",
+    titre: "LIEN SIGNATURE",
+    aliases: ["lien signature", "url signature"]
+  },
+  {
+    cle: "token_signature_hash",
+    titre: "TOKEN SIGNATURE HASH",
+    aliases: ["token signature hash", "empreinte token signature"]
+  },
+  {
+    cle: "otp_signature_hash",
+    titre: "OTP SIGNATURE HASH",
+    aliases: ["otp signature hash", "empreinte otp"]
+  },
+  {
+    cle: "otp_expiration",
+    titre: "OTP EXPIRATION",
+    aliases: ["otp expiration", "expiration otp"]
+  },
+  {
+    cle: "otp_tentatives",
+    titre: "OTP TENTATIVES",
+    aliases: ["otp tentatives", "tentatives otp"]
+  },
+  {
+    cle: "date_derniere_otp",
+    titre: "DATE DERNIER OTP",
+    aliases: ["date dernier otp", "dernier envoi otp"]
+  },
+  {
+    cle: "lien_pdf_signe",
+    titre: "LIEN PDF SIGNE",
+    aliases: ["lien pdf signe", "lien pdf signé", "pdf signé"]
+  },
+  {
+    cle: "lien_dossier_preuve",
+    titre: "LIEN DOSSIER DE PREUVE",
+    aliases: ["lien dossier de preuve", "preuve signature"]
+  },
+  {
+    cle: "niveau_signature",
+    titre: "NIVEAU SIGNATURE",
+    aliases: ["niveau signature", "type signature"]
+  },
+  {
+    cle: "consentement_signature",
+    titre: "CONSENTEMENT SIGNATURE",
+    aliases: ["consentement signature", "texte consentement"]
+  },
+  {
+    cle: "user_agent_signature",
+    titre: "USER AGENT SIGNATURE",
+    aliases: ["user agent signature", "navigateur signature"]
+  },
+  {
+    cle: "empreinte_pdf_original",
+    titre: "EMPREINTE PDF ORIGINAL",
+    aliases: ["empreinte pdf original", "hash pdf original"]
+  },
+  {
+    cle: "empreinte_pdf_signe",
+    titre: "EMPREINTE PDF SIGNE",
+    aliases: ["empreinte pdf signe", "hash pdf signé"]
+  },
+  {
+    cle: "id_fichier_signature_image",
+    titre: "ID IMAGE SIGNATURE",
+    aliases: ["id image signature", "id fichier signature"]
+  },
+  {
+    cle: "id_evenement_signature",
+    titre: "ID EVENEMENT SIGNATURE",
+    aliases: ["id evenement signature", "id événement signature"]
+  },
+  {
+    cle: "derniere_relance_signature",
+    titre: "DERNIERE RELANCE SIGNATURE",
+    aliases: ["derniere relance signature", "dernière relance signature"]
+  },
+  {
+    cle: "erreur_signature",
+    titre: "ERREUR SIGNATURE",
+    aliases: ["erreur signature", "signature error"]
+  },
+  {
+    cle: "donnees_brutes",
+    titre: "DONNEES BRUTES JSON",
+    aliases: ["donnees brutes json", "données brutes json", "json"]
+  }
+]);
+
+// ============================================================================
+// 4. POINTS D'ENTRÉE HTTP
+// ============================================================================
+
+/**
+ * Vérification de disponibilité de l'API.
+ * Ouvrir l'URL /exec dans un navigateur pour contrôler le déploiement.
+ */
+function doGet(e) {
+  try {
+    const action = normaliserTexte_(
+      e && e.parameter ? e.parameter.action : ""
+    );
+
+    if (action === "SIGNER") {
+      const template = HtmlService.createTemplateFromFile(
+        CONFIG.SIGNATURE_INTERNE.NOM_FICHIER_HTML
+      );
+
+      template.tokenInitial = nettoyerValeur_(
+        e && e.parameter ? e.parameter.token : ""
+      );
+
+      return template
+        .evaluate()
+        .setTitle("Signature de votre lettre d'admission")
+        .setXFrameOptionsMode(
+          HtmlService.XFrameOptionsMode.DEFAULT
+        );
+    }
+
+    const html =
+      '<!doctype html><html lang="fr"><head>' +
+      '<meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<title>Portail Admissions</title>' +
+      '<style>' +
+      'body{font-family:Arial,sans-serif;background:#f4f7fb;margin:0;padding:32px;color:#17324d}' +
+      '.card{max-width:680px;margin:60px auto;background:#fff;border-radius:18px;padding:32px;box-shadow:0 12px 35px rgba(17,45,78,.12)}' +
+      '.ok{display:inline-block;background:#e8f7ee;color:#166534;padding:8px 12px;border-radius:999px;font-weight:700}' +
+      'code{word-break:break-all;background:#f2f4f7;padding:3px 6px;border-radius:5px}' +
+      '</style></head><body><main class="card">' +
+      '<span class="ok">SERVICE OPÉRATIONNEL</span>' +
+      '<h1>Portail Admissions</h1>' +
+      '<p>Le déploiement Apps Script répond correctement.</p>' +
+      '<p>Version : <strong>' + echapperHtml_(CONFIG.VERSION) + '</strong></p>' +
+      '<p>Le portail de signature utilise une adresse du type :</p>' +
+      '<code>/exec?action=signer&amp;token=...</code>' +
+      '</main></body></html>';
+
+    return HtmlService
+      .createHtmlOutput(html)
+      .setTitle("Portail Admissions");
+  } catch (erreur) {
+    return HtmlService
+      .createHtmlOutput(
+        "<h2>Erreur du portail</h2><pre>" +
+        echapperHtml_(
+          erreur && erreur.message
+            ? erreur.message
+            : "Erreur inconnue"
+        ) +
+        "</pre>"
+      )
+      .setTitle("Erreur du portail");
+  }
+}
+
+/**
+ * Réception d'une candidature envoyée par un formulaire externe.
+ *
+ * Corps recommandé :
+ * Content-Type: text/plain;charset=utf-8
+ * JSON.stringify(donneesEtudiant)
+ */
+function doPost(e) {
+  try {
+    // Les six frontends envoient actuellement :
+    // { donnees: {...}, fichiers: {...} }
+    // Cette fonction accepte également un objet déjà aplati.
+    const corpsRecu = lireCorpsRequete_(e);
+    const donneesEtudiant = normaliserEnveloppeFrontend_(corpsRecu);
+    const resultat = traiterCandidature_(donneesEtudiant, "WEB");
+
+    // La référence est renvoyée à la fois dans data et à la racine afin de
+    // rester compatible avec toutes les versions des frontends.
+    return creerReponseJson_({
+      success: true,
+      result: "success",
+      message: "Candidature enregistrée.",
+      reference: resultat.reference_dossier,
+      numero: resultat.reference_dossier,
+      numeroDossier: resultat.reference_dossier,
+      data: resultat
+    });
+  } catch (erreur) {
+    console.error(erreur && erreur.stack ? erreur.stack : erreur);
+
+    return creerReponseJson_({
+      success: false,
+      result: "error",
+      message: erreur && erreur.message
+        ? erreur.message
+        : "Erreur inconnue pendant l'enregistrement."
+    });
+  }
+}
+
+// ============================================================================
+// 5. SAISIE MANUELLE ET INTERNE
+// ============================================================================
+
+/**
+ * Injecte une candidature depuis un autre fichier Apps Script,
+ * un import CSV, une interface interne ou une fonction métier.
+ *
+ * Exemple :
+ * const resultat = enregistrerCandidatInterne({
+ *   ecole: "ILMIS",
+ *   campus: "TORCY",
+ *   pays_residence: "France",
+ *   nom: "DUPONT",
+ *   prenom: "Alice",
+ *   email: "alice.dupont@example.com",
+ *   formation: "Bachelor Commerce International"
+ * });
+ *
+ * @param {Object} donneesEtudiant
+ * @return {Object}
+ */
+function enregistrerCandidatInterne(donneesEtudiant) {
+  if (!donneesEtudiant || typeof donneesEtudiant !== "object") {
+    throw new Error("donneesEtudiant doit être un objet JavaScript.");
+  }
+
+  const copie = JSON.parse(JSON.stringify(donneesEtudiant));
+  return traiterCandidature_(copie, "INTERNE");
+}
+
+// ============================================================================
+// 6. TRAITEMENT CENTRAL
+// ============================================================================
+
+/**
+ * Toute candidature, qu'elle soit WEB, INTERNE ou TEST,
+ * passe obligatoirement par cette fonction.
+ *
+ * @param {Object} payload
+ * @param {String} sourceDefaut
+ * @return {Object}
+ */
+function traiterCandidature_(payload, sourceDefaut) {
+  const verrou = LockService.getScriptLock();
+
+  if (!verrou.tryLock(30000)) {
+    throw new Error("Le serveur traite déjà plusieurs candidatures. Réessayez dans quelques secondes.");
+  }
+
+  try {
+    validerCleApi_(payload);
+    const donnees = normaliserDonneesCandidat_(payload, sourceDefaut);
+    validerDonneesObligatoires_(donnees);
+
+    const ecole = determinerEcole_(donnees.ecole);
+    const campus = determinerCampus_(ecole, donnees.campus);
+    const typeAdmission = determinerTypeAdmission_(donnees.pays_residence);
+    const spreadsheetId = obtenirIdSheet_(campus, typeAdmission);
+
+    const classeur = SpreadsheetApp.openById(spreadsheetId);
+    const feuille = obtenirOuCreerOnglet_(classeur, ecole);
+    const correspondanceColonnes = synchroniserColonnes_(feuille);
+
+    if (
+      CONFIG.BLOQUER_DOUBLONS_EMAIL &&
+      !donnees.autoriser_doublon &&
+      estDoublonEmail_(feuille, correspondanceColonnes.email, donnees.email)
+    ) {
+      throw new Error(
+        "Une candidature existe déjà avec cette adresse e-mail dans cette école, sur ce campus et dans ce flux."
+      );
+    }
+
+    const reference = genererReferenceDossier_(ecole, campus);
+    const maintenant = new Date();
+
+    const liensExistants = extraireLiensPiecesPayload_(payload);
+    const liensCrees = enregistrerPiecesCandidat_(
+      payload.pieces || payload.fichiers || payload.documents || {},
+      {
+        ecole: ecole,
+        campus: campus,
+        typeAdmission: typeAdmission,
+        reference: reference,
+        nomComplet: donnees.nom_complet
+      }
+    );
+    const liensPieces = Object.assign({}, liensExistants, liensCrees);
+    const piecesManquantes = detecterPiecesManquantes_(
+      typeAdmission,
+      liensPieces,
+      donnees.handicap
+    );
+    const statutInitial = donnees.statut || (
+      piecesManquantes.length > 0
+        ? "DOSSIER INCOMPLET - À CONTRÔLER"
+        : "DOSSIER COMPLET - À VALIDER"
+    );
+
+    const valeurs = {
+      date_soumission: formaterDate_(maintenant),
+      reference_dossier: reference,
+      source: donnees.source,
+      type_admission: typeAdmission,
+      ecole: ecole,
+      campus: campus,
+      nom_complet: donnees.nom_complet,
+      nom: donnees.nom,
+      prenom: donnees.prenom,
+      date_naissance: donnees.date_naissance,
+      lieu_naissance: donnees.lieu_naissance,
+      pays_residence: donnees.pays_residence,
+      ville: donnees.ville,
+      adresse: donnees.adresse,
+      telephone: donnees.telephone,
+      telephone_proche: donnees.telephone_proche,
+      email: donnees.email,
+      cycle: donnees.cycle,
+      niveau_academique: donnees.niveau_academique,
+      domaine: donnees.domaine,
+      formation: donnees.formation,
+      code_rncp: donnees.code_rncp,
+      rythme: donnees.rythme,
+      financement: donnees.financement,
+      handicap: donnees.handicap,
+      motif_non_conformite: "",
+      pieces_manquantes: piecesManquantes
+        .map(function(code) { return CONFIG.LIBELLES_PIECES[code] || code; })
+        .join(", "),
+      lien_cv: liensPieces.CV || "",
+      lien_diplome: liensPieces.DIPLOME || "",
+      lien_piece_identite: liensPieces.PIECE_IDENTITE || "",
+      lien_carte_vitale: liensPieces.CARTE_VITALE || "",
+      lien_justificatif_handicap: liensPieces.JUSTIFICATIF_HANDICAP || "",
+      lien_pdf_lettre: "",
+      date_decision: "",
+      date_email: "",
+      valide_par: "",
+      statut: statutInitial,
+      donnees_brutes: JSON.stringify(payload)
+    };
+
+    const numeroLigne = insererLigne_(feuille, correspondanceColonnes, valeurs);
+
+    SpreadsheetApp.flush();
+
+    return {
+      reference_dossier: reference,
+      ecole: ecole,
+      campus: campus,
+      type_admission: typeAdmission,
+      spreadsheet_id: spreadsheetId,
+      onglet: feuille.getName(),
+      ligne: numeroLigne,
+      pieces_manquantes: piecesManquantes,
+      date_soumission: valeurs.date_soumission
+    };
+  } finally {
+    verrou.releaseLock();
+  }
+}
+
+// ============================================================================
+// 7. NORMALISATION ET VALIDATION
+// ============================================================================
+
+function normaliserDonneesCandidat_(payload, sourceDefaut) {
+  const indicatifTel = nettoyerValeur_(premiereValeur_(payload, [
+    "indicatif_tel",
+    "indicatifTelephone",
+    "country_code"
+  ]));
+
+  const numeroTel = nettoyerValeur_(premiereValeur_(payload, [
+    "telephone",
+    "tel",
+    "phone"
+  ]));
+
+  const indicatifProche = nettoyerValeur_(premiereValeur_(payload, [
+    "indicatif_proche",
+    "indicatifTelephoneProche"
+  ]));
+
+  const numeroProche = nettoyerValeur_(premiereValeur_(payload, [
+    "telephone_proche",
+    "telephoneProche",
+    "urgence"
+  ]));
+
+  const nom = nettoyerValeur_(premiereValeur_(payload, [
+    "nom",
+    "last_name",
+    "lastname"
+  ])).toUpperCase();
+
+  const prenom = nettoyerValeur_(premiereValeur_(payload, [
+    "prenom",
+    "prénom",
+    "first_name",
+    "firstname"
+  ]));
+
+  const nomCompletRecu = nettoyerValeur_(premiereValeur_(payload, [
+    "nom_complet",
+    "nom_prenoms",
+    "nomPrenoms"
+  ]));
+
+  const financementFrance = nettoyerValeur_(premiereValeur_(payload, [
+    "financement_fr",
+    "financementFrance"
+  ]));
+
+  const financementInternational = nettoyerValeur_(premiereValeur_(payload, [
+    "financement_hors_fr",
+    "financementInternational"
+  ]));
+
+  return {
+    ecole: nettoyerValeur_(premiereValeur_(payload, ["ecole", "école", "school"])),
+    campus: nettoyerValeur_(premiereValeur_(payload, ["campus", "site"])),
+    pays_residence: nettoyerValeur_(premiereValeur_(payload, [
+      "pays_residence",
+      "paysResidence",
+      "pays"
+    ])),
+    nom: nom,
+    prenom: prenom,
+    nom_complet: nomCompletRecu || [nom, prenom].filter(Boolean).join(" ").trim(),
+    date_naissance: nettoyerValeur_(premiereValeur_(payload, [
+      "ddn",
+      "date_naissance",
+      "dateNaissance"
+    ])),
+    lieu_naissance: nettoyerValeur_(premiereValeur_(payload, [
+      "ldn",
+      "lieu_naissance",
+      "lieuNaissance"
+    ])),
+    ville: nettoyerValeur_(premiereValeur_(payload, [
+      "ville",
+      "ville_residence",
+      "villeResidence"
+    ])),
+    adresse: nettoyerValeur_(premiereValeur_(payload, [
+      "adresse",
+      "adresse_postale",
+      "address"
+    ])),
+    telephone: joindreTelephone_(indicatifTel, numeroTel),
+    telephone_proche: joindreTelephone_(indicatifProche, numeroProche),
+    email: nettoyerValeur_(premiereValeur_(payload, [
+      "email",
+      "adresse_email",
+      "mail"
+    ])).toLowerCase(),
+    cycle: nettoyerValeur_(premiereValeur_(payload, [
+      "cycle",
+      "type_cycle",
+      "typeCycle"
+    ])),
+    niveau_academique: nettoyerValeur_(premiereValeur_(payload, [
+      "niveau_academique",
+      "niveauAcademique",
+      "niveau_etude",
+      "niveauEtude"
+    ])),
+    domaine: nettoyerValeur_(premiereValeur_(payload, [
+      "domaine",
+      "specialite",
+      "spécialité",
+      "niveau"
+    ])),
+    formation: nettoyerValeur_(premiereValeur_(payload, [
+      "formation",
+      "programme"
+    ])),
+    code_rncp: nettoyerValeur_(premiereValeur_(payload, [
+      "code_rncp",
+      "codeRncp",
+      "rncp"
+    ])),
+    rythme: nettoyerValeur_(premiereValeur_(payload, [
+      "rythme_academique",
+      "rythmeAcademique",
+      "rythme",
+      "modalite",
+      "modalité"
+    ])),
+    financement: nettoyerValeur_(
+      premiereValeur_(payload, ["financement"]) ||
+      financementFrance ||
+      financementInternational
+    ),
+    handicap: nettoyerValeur_(premiereValeur_(payload, [
+      "handicap",
+      "situation_handicap",
+      "situationHandicap"
+    ])),
+    statut: nettoyerValeur_(premiereValeur_(payload, ["statut", "status"])),
+    source: nettoyerValeur_(premiereValeur_(payload, ["source"])) || sourceDefaut || "INCONNUE",
+    autoriser_doublon: payload.autoriser_doublon === true || payload.autoriserDoublon === true
+  };
+}
+
+function validerDonneesObligatoires_(donnees) {
+  const erreurs = [];
+
+  if (!donnees.ecole) erreurs.push("école");
+  if (!donnees.pays_residence) erreurs.push("pays de résidence");
+  if (!donnees.nom_complet) erreurs.push("nom et prénom");
+  if (!donnees.email) erreurs.push("adresse e-mail");
+  if (!donnees.cycle) erreurs.push("cycle");
+  if (!donnees.niveau_academique) erreurs.push("niveau académique");
+  if (!donnees.domaine) erreurs.push("domaine");
+  if (!donnees.formation) erreurs.push("formation");
+  if (!donnees.rythme) erreurs.push("rythme académique");
+
+  if (donnees.email && !emailValide_(donnees.email)) {
+    erreurs.push("adresse e-mail invalide");
+  }
+
+  if (erreurs.length > 0) {
+    throw new Error("Données obligatoires absentes ou invalides : " + erreurs.join(", ") + ".");
+  }
+}
+
+function validerCleApi_(payload) {
+  if (!CONFIG.EXIGER_CLE_API) return;
+
+  const cleConfiguree = PropertiesService
+    .getScriptProperties()
+    .getProperty("ADMISSIONS_API_KEY");
+
+  if (!cleConfiguree) {
+    throw new Error("La sécurité par clé API est activée, mais ADMISSIONS_API_KEY n'est pas configurée.");
+  }
+
+  const cleRecue = nettoyerValeur_(payload.api_key || payload.apiKey);
+
+  if (!cleRecue || cleRecue !== cleConfiguree) {
+    throw new Error("Clé API absente ou invalide.");
+  }
+}
+
+// ============================================================================
+// 8. ROUTAGE INTELLIGENT
+// ============================================================================
+
+function determinerEcole_(valeurEcole) {
+  const valeurNormalisee = normaliserTexte_(valeurEcole);
+  const ecole = CONFIG.ALIASES_ECOLES[valeurNormalisee] || valeurNormalisee;
+
+  if (
+    !CONFIG.ECOLES_MONO_CAMPUS[ecole] &&
+    !CONFIG.ECOLES_MULTI_CAMPUS[ecole]
+  ) {
+    throw new Error(
+      'École non reconnue : "' + valeurEcole + '". Ajoutez-la dans CONFIG.'
+    );
+  }
+
+  return ecole;
+}
+
+function determinerCampus_(ecole, campusRecu) {
+  const configMono = CONFIG.ECOLES_MONO_CAMPUS[ecole];
+
+  if (configMono) {
+    return configMono.CAMPUS_FIXE;
+  }
+
+  const configMulti = CONFIG.ECOLES_MULTI_CAMPUS[ecole];
+
+  if (!configMulti) {
+    throw new Error("Aucune configuration campus trouvée pour " + ecole + ".");
+  }
+
+  const campus = normaliserCampus_(campusRecu);
+
+  if (!campus) {
+    throw new Error(
+      "Le campus est obligatoire pour l'école multi-campus " + ecole + "."
+    );
+  }
+
+  if (configMulti.CAMPUS_AUTORISES.indexOf(campus) === -1) {
+    throw new Error(
+      "Campus invalide pour " + ecole +
+      ". Campus autorisés : " + configMulti.CAMPUS_AUTORISES.join(", ") + "."
+    );
+  }
+
+  return campus;
+}
+
+function determinerTypeAdmission_(paysResidence) {
+  const pays = normaliserTexte_(paysResidence);
+
+  if (!pays) {
+    throw new Error(
+      "Le pays de résidence est obligatoire pour déterminer le type d'admission."
+    );
+  }
+
+  /**
+   * RÈGLE MÉTIER :
+   * - Résidence en France -> NATIONAL
+   * - Résidence hors de France -> INTERNATIONAL
+   */
+  const valeursFrance = [
+    "FRANCE",
+    "FR",
+    "FRA",
+    "REPUBLIQUE FRANCAISE"
+  ];
+
+  return valeursFrance.indexOf(pays) !== -1
+    ? "NATIONAL"
+    : "INTERNATIONAL";
+}
+
+function obtenirIdSheet_(campus, typeAdmission) {
+  const routeCampus = ROUTEUR_SHEETS[campus];
+
+  if (!routeCampus) {
+    throw new Error("Aucun routage Google Sheets configuré pour le campus " + campus + ".");
+  }
+
+  const spreadsheetId = routeCampus[typeAdmission];
+
+  if (!spreadsheetId) {
+    throw new Error(
+      "Aucun Google Sheet configuré pour " + campus + " / " + typeAdmission + "."
+    );
+  }
+
+  return spreadsheetId;
+}
+
+// ============================================================================
+// 9. GESTION DES GOOGLE SHEETS
+// ============================================================================
+
+function obtenirOuCreerOnglet_(classeur, ecole) {
+  const variantesParEcole = {
+    "DCG FORMATIONS": ["DCG FORMATIONS", "DCG FORMATION", "DCG"],
+    "ESMAS": ["ESMAS", "ESMASS"],
+    "MLV BS": ["MLV BS", "MLV-BS", "MLV BUSINESS SCHOOL", "MARNE LA VALLEE BUSINESS SCHOOL"],
+    "MLV BTS": ["MLV BTS", "MARNE LA VALLEE BTS"],
+    "EVRY BS": ["EVRY BS", "EVRY BUSINESS SCHOOL"]
+  };
+  const variantes = variantesParEcole[ecole] || [ecole];
+
+  for (let i = 0; i < variantes.length; i++) {
+    const feuille = classeur.getSheetByName(variantes[i]);
+    if (feuille) return feuille;
+  }
+
+  throw new Error(
+    "L'onglet de l'école " + ecole + " n'existe pas dans ce classeur. " +
+    "Le backend est configuré pour ne créer aucun nouvel onglet."
+  );
+}
+
+/**
+ * Réutilise uniquement les colonnes existantes grâce aux alias.
+ * Ne crée aucune colonne et ne modifie aucun en-tête.
+ *
+ * @return {Object} correspondance cle -> numéro de colonne (base 1)
+ */
+function synchroniserColonnes_(feuille) {
+  const derniereColonne = feuille.getLastColumn();
+
+  if (derniereColonne < 1) {
+    throw new Error(
+      "L'onglet " + feuille.getName() + " ne contient aucun en-tête en ligne 1."
+    );
+  }
+
+  const enTetes = feuille
+    .getRange(1, 1, 1, derniereColonne)
+    .getDisplayValues()[0];
+
+  const correspondance = {};
+  const indexNormalises = {};
+
+  enTetes.forEach(function(titre, index) {
+    const cleNormalisee = normaliserEntete_(titre);
+    if (cleNormalisee && indexNormalises[cleNormalisee] === undefined) {
+      indexNormalises[cleNormalisee] = index + 1;
+    }
+  });
+
+  CHAMPS.forEach(function(champ) {
+    const candidats = [champ.titre].concat(champ.aliases || []);
+
+    for (let i = 0; i < candidats.length; i++) {
+      const enteteNormalisee = normaliserEntete_(candidats[i]);
+      if (indexNormalises[enteteNormalisee] !== undefined) {
+        correspondance[champ.cle] = indexNormalises[enteteNormalisee];
+        break;
+      }
+    }
+  });
+
+  if (!correspondance.email) {
+    throw new Error(
+      "Aucune colonne e-mail reconnue dans l'onglet " + feuille.getName() + ". " +
+      "Le backend ne crée plus de colonne automatiquement."
+    );
+  }
+
+  return correspondance;
+}
+
+function trouverPremiereLigneVideExistante_(feuille, correspondanceColonnes) {
+  const premiereLigneDonnees = 2;
+  const derniereLigneDisponible = feuille.getMaxRows();
+
+  if (derniereLigneDisponible < premiereLigneDonnees) {
+    throw new Error(
+      "Aucune ligne de saisie n'existe dans l'onglet " + feuille.getName() + "."
+    );
+  }
+
+  const colonnesControle = [
+    correspondanceColonnes.reference_dossier,
+    correspondanceColonnes.email,
+    correspondanceColonnes.nom_complet,
+    correspondanceColonnes.nom
+  ].filter(Boolean);
+
+  const colonneControle = colonnesControle[0];
+  const nombreLignes = derniereLigneDisponible - premiereLigneDonnees + 1;
+  const valeurs = feuille
+    .getRange(premiereLigneDonnees, colonneControle, nombreLignes, 1)
+    .getDisplayValues();
+
+  for (let i = 0; i < valeurs.length; i++) {
+    if (!nettoyerValeur_(valeurs[i][0])) {
+      return premiereLigneDonnees + i;
+    }
+  }
+
+  throw new Error(
+    "Le tableau de l'onglet " + feuille.getName() +
+    " ne contient plus de ligne vide existante. Aucune nouvelle ligne n'a été ajoutée."
+  );
+}
+
+function insererLigne_(feuille, correspondanceColonnes, valeurs) {
+  const numeroLigne = trouverPremiereLigneVideExistante_(
+    feuille,
+    correspondanceColonnes
+  );
+
+  Object.keys(valeurs).forEach(function(cle) {
+    const numeroColonne = correspondanceColonnes[cle];
+    if (numeroColonne) {
+      feuille.getRange(numeroLigne, numeroColonne).setValue(valeurs[cle]);
+    }
+  });
+
+  return numeroLigne;
+}
+
+function estDoublonEmail_(feuille, colonneEmail, email) {
+  if (!colonneEmail || !email || feuille.getLastRow() < 2) {
+    return false;
+  }
+
+  const plage = feuille.getRange(
+    2,
+    colonneEmail,
+    feuille.getLastRow() - 1,
+    1
+  );
+
+  const resultat = plage
+    .createTextFinder(email)
+    .matchEntireCell(true)
+    .matchCase(false)
+    .findNext();
+
+  return resultat !== null;
+}
+
+// ============================================================================
+// 10. RÉCEPTION ET RÉPONSES HTTP
+// ============================================================================
+
+function lireCorpsRequete_(e) {
+  if (!e) {
+    throw new Error("Événement HTTP absent.");
+  }
+
+  const contenu = e.postData && e.postData.contents
+    ? e.postData.contents.trim()
+    : "";
+
+  if (contenu) {
+    try {
+      const json = JSON.parse(contenu);
+
+      if (!json || typeof json !== "object" || Array.isArray(json)) {
+        throw new Error("Le JSON doit représenter un objet.");
+      }
+
+      return json;
+    } catch (erreurJson) {
+      // Compatibilité avec un corps de type data={...}
+      if (e.parameter && e.parameter.data) {
+        try {
+          return JSON.parse(e.parameter.data);
+        } catch (erreurData) {
+          throw new Error("Le paramètre data ne contient pas un JSON valide.");
+        }
+      }
+
+      throw new Error("Corps JSON invalide : " + erreurJson.message);
+    }
+  }
+
+  // Compatibilité avec application/x-www-form-urlencoded.
+  if (e.parameter && Object.keys(e.parameter).length > 0) {
+    return Object.assign({}, e.parameter);
+  }
+
+  throw new Error("Aucune donnée n'a été reçue.");
+}
+
+/**
+ * Rend le backend compatible avec les deux formats suivants :
+ * 1. { donnees: {...}, fichiers: {...} }  <- format actuel des frontends
+ * 2. { nom: ..., ecole: ..., pieces: ... } <- format aplati historique
+ */
+function normaliserEnveloppeFrontend_(corps) {
+  if (!corps || typeof corps !== "object" || Array.isArray(corps)) {
+    throw new Error("Le corps de la requête doit être un objet JSON.");
+  }
+
+  const donnees = corps.donnees &&
+    typeof corps.donnees === "object" &&
+    !Array.isArray(corps.donnees)
+      ? corps.donnees
+      : {};
+
+  // On conserve aussi les éventuels paramètres placés à la racine
+  // (api_key, autoriser_doublon, source, etc.).
+  const payload = Object.assign({}, corps, donnees);
+
+  const fichiers = corps.fichiers ||
+    corps.pieces ||
+    corps.documents ||
+    donnees.fichiers ||
+    donnees.pieces ||
+    donnees.documents ||
+    {};
+
+  payload.pieces = fichiers;
+
+  delete payload.donnees;
+  delete payload.fichiers;
+  delete payload.documents;
+
+  return payload;
+}
+
+function creerReponseJson_(objet) {
+  return ContentService
+    .createTextOutput(JSON.stringify(objet))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================================================
+// 11. TESTS
+// ============================================================================
+
+/**
+ * Teste le routage sans écrire dans un Google Sheet.
+ */
+function testerRoutageSansEcriture() {
+  const casDeTest = [
+    {
+      ecole: "ILMIS",
+      campus: "Campus Torcy",
+      pays: "France",
+      campusAttendu: "TORCY",
+      fluxAttendu: "NATIONAL"
+    },
+    {
+      ecole: "EMSP",
+      campus: "TORCY",
+      pays: "Cameroun",
+      campusAttendu: "TORCY",
+      fluxAttendu: "INTERNATIONAL"
+    },
+    {
+      ecole: "ESIIA",
+      campus: "Campus d'Évry",
+      pays: "France",
+      campusAttendu: "EVRY",
+      fluxAttendu: "NATIONAL"
+    },
+    {
+      ecole: "ESMEP",
+      campus: "Évry",
+      pays: "Sénégal",
+      campusAttendu: "EVRY",
+      fluxAttendu: "INTERNATIONAL"
+    },
+    {
+      ecole: "ISMOD",
+      campus: "Campus Lyon",
+      pays: "France",
+      campusAttendu: "LYON",
+      fluxAttendu: "NATIONAL"
+    },
+    {
+      ecole: "DCG Formation",
+      campus: "LYON",
+      pays: "Côte d'Ivoire",
+      campusAttendu: "LYON",
+      fluxAttendu: "INTERNATIONAL"
+    }
+  ];
+
+  const resultats = casDeTest.map(function(test) {
+    const ecole = determinerEcole_(test.ecole);
+    const campus = determinerCampus_(ecole, test.campus);
+    const flux = determinerTypeAdmission_(test.pays);
+    const spreadsheetId = obtenirIdSheet_(campus, flux);
+
+    return {
+      ecole: ecole,
+      campus: campus,
+      pays: test.pays,
+      flux: flux,
+      spreadsheetId: spreadsheetId,
+      conforme:
+        campus === test.campusAttendu &&
+        flux === test.fluxAttendu
+    };
+  });
+
+  const echecs = resultats.filter(function(resultat) {
+    return !resultat.conforme;
+  });
+
+  console.log(JSON.stringify(resultats, null, 2));
+
+  if (echecs.length > 0) {
+    throw new Error(
+      echecs.length +
+      " test(s) de routage ont échoué."
+    );
+  }
+
+  return resultats;
+}
+
+/**
+ * Affiche les six fichiers de destination configurés.
+ */
+function afficherMatriceRoutage() {
+  const matrice = [];
+
+  ["TORCY", "EVRY", "LYON", "NOISIEL"].forEach(function(campus) {
+    ["NATIONAL", "INTERNATIONAL"].forEach(function(flux) {
+      matrice.push({
+        campus: campus,
+        flux: flux,
+        spreadsheetId: ROUTEUR_SHEETS[campus][flux]
+      });
+    });
+  });
+
+  console.log(JSON.stringify(matrice, null, 2));
+  return matrice;
+}
+
+/**
+ * TEST COMPLET : écrit réellement une ligne dans le Google Sheet routé.
+ *
+ * Le test ci-dessous :
+ * - utilise ILMIS ;
+ * - route vers TORCY ;
+ * - utilise Cameroun, donc vers le flux INTERNATIONAL ;
+ * - autorise le doublon pour permettre plusieurs tests.
+ */
+function testerRecolteEtEnvoi() {
+  const horodatage = new Date().getTime();
+
+  const donneesTest = {
+    source: "TEST_APPS_SCRIPT",
+    ecole: "ILMIS",
+    campus: "TORCY",
+    pays_residence: "Cameroun",
+    nom: "TEST",
+    prenom: "CANDIDAT " + horodatage,
+    ddn: "2000-01-01",
+    ldn: "Douala",
+    ville: "Douala",
+    adresse: "Adresse de test",
+    indicatif_tel: "+237",
+    telephone: "600000000",
+    email: "test.admission." + horodatage + "@example.com",
+    cycle: "Bachelor",
+    niveau: "Commerce",
+    formation: "Bachelor Commerce International",
+    rythme: "Initial",
+    financement_hors_fr: "Financement personnel",
+    handicap: "Non",
+    autoriser_doublon: true
+  };
+
+  const resultat = traiterCandidature_(donneesTest, "TEST");
+  console.log(JSON.stringify(resultat, null, 2));
+  return resultat;
+}
+
+// ============================================================================
+// 12. UTILITAIRES
+// ============================================================================
+
+function premiereValeur_(objet, cles) {
+  for (let i = 0; i < cles.length; i++) {
+    const valeur = objet[cles[i]];
+
+    if (valeur !== undefined && valeur !== null && String(valeur).trim() !== "") {
+      return valeur;
+    }
+  }
+
+  return "";
+}
+
+function nettoyerValeur_(valeur) {
+  if (valeur === undefined || valeur === null) return "";
+  return String(valeur).trim();
+}
+
+function joindreTelephone_(indicatif, numero) {
+  const code = nettoyerValeur_(indicatif);
+  const tel = nettoyerValeur_(numero);
+
+  if (!code) return tel;
+  if (!tel) return code;
+
+  return (code + " " + tel).replace(/\s+/g, " ").trim();
+}
+
+function normaliserTexte_(valeur) {
+  return nettoyerValeur_(valeur)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .toUpperCase();
+}
+
+function normaliserEntete_(valeur) {
+  return normaliserTexte_(valeur)
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim();
+}
+
+function normaliserCampus_(valeur) {
+  const campus = normaliserTexte_(valeur);
+
+  // Valeurs acceptées :
+  // TORCY, Campus Torcy, Campus de Torcy
+  // EVRY, Évry, Campus d'Évry
+  // LYON, Campus Lyon, Campus de Lyon
+  if (campus.indexOf("TORCY") !== -1) return "TORCY";
+  if (campus.indexOf("EVRY") !== -1) return "EVRY";
+  if (campus.indexOf("LYON") !== -1) return "LYON";
+  if (campus.indexOf("NOISIEL") !== -1 || campus.indexOf("MARNE LA VALLEE") !== -1) return "NOISIEL";
+
+  return "";
+}
+
+function emailValide_(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function genererReferenceDossier_(ecole, campus) {
+  const prefixeEcole = normaliserTexte_(ecole)
+    .replace(/[^A-Z0-9]/g, "")
+    .substring(0, 5);
+
+  const prefixeCampus = campus.substring(0, 3);
+  const date = Utilities.formatDate(new Date(), CONFIG.FUSEAU_HORAIRE, "yyyyMMdd");
+  const suffixe = Utilities.getUuid()
+    .replace(/-/g, "")
+    .substring(0, 6)
+    .toUpperCase();
+
+  return prefixeEcole + "-" + prefixeCampus + "-" + date + "-" + suffixe;
+}
+
+function formaterDate_(date) {
+  return Utilities.formatDate(
+    date,
+    CONFIG.FUSEAU_HORAIRE,
+    "dd/MM/yyyy HH:mm:ss"
+  );
+}
+// ============================================================================
+// 13. COLLECTE DES PIÈCES JOINTES ET ARCHIVAGE DRIVE
+// ============================================================================
+
+function extraireLiensPiecesPayload_(payload) {
+  return {
+    CV: nettoyerValeur_(premiereValeur_(payload, ["lien_cv", "lienCV"])),
+    DIPLOME: nettoyerValeur_(premiereValeur_(payload, [
+      "lien_diplome",
+      "lienDiplome"
+    ])),
+    PIECE_IDENTITE: nettoyerValeur_(premiereValeur_(payload, [
+      "lien_piece_identite",
+      "lienPieceIdentite"
+    ])),
+    CARTE_VITALE: nettoyerValeur_(premiereValeur_(payload, [
+      "lien_carte_vitale",
+      "lienCarteVitale"
+    ])),
+    JUSTIFICATIF_HANDICAP: nettoyerValeur_(premiereValeur_(payload, [
+      "lien_justificatif_handicap",
+      "lienJustificatifHandicap",
+      "lien_rqth"
+    ]))
+  };
+}
+
+function enregistrerPiecesCandidat_(pieces, contexte) {
+  if (!pieces || typeof pieces !== "object" || Array.isArray(pieces)) {
+    return {};
+  }
+
+  const correspondance = {
+    cv: "CV",
+    CV: "CV",
+    diplome: "DIPLOME",
+    DIPLOME: "DIPLOME",
+    piece_identite: "PIECE_IDENTITE",
+    pieceIdentite: "PIECE_IDENTITE",
+    identite: "PIECE_IDENTITE",
+    PIECE_IDENTITE: "PIECE_IDENTITE",
+    carte_vitale: "CARTE_VITALE",
+    carteVitale: "CARTE_VITALE",
+    vitale: "CARTE_VITALE",
+    CARTE_VITALE: "CARTE_VITALE",
+    justificatif_handicap: "JUSTIFICATIF_HANDICAP",
+    rqth: "JUSTIFICATIF_HANDICAP",
+    JUSTIFICATIF_HANDICAP: "JUSTIFICATIF_HANDICAP"
+  };
+
+  const codesRecus = Object.keys(pieces).filter(function(cle) {
+    return correspondance[cle] && pieces[cle];
+  });
+
+  if (codesRecus.length === 0) {
+    return {};
+  }
+
+  const dossierCandidat = obtenirDossierCandidat_(
+    contexte.ecole,
+    contexte.campus,
+    contexte.typeAdmission,
+    contexte.reference,
+    contexte.nomComplet
+  );
+
+  const resultat = {};
+
+  codesRecus.forEach(function(clePayload) {
+    const code = correspondance[clePayload];
+    const fichier = normaliserFichierPayload_(pieces[clePayload]);
+
+    if (!fichier) return;
+
+    const nomPropre = construireNomFichierPiece_(
+      code,
+      contexte.reference,
+      fichier.nom
+    );
+
+    const octets = Utilities.base64Decode(fichier.base64);
+    const blob = Utilities.newBlob(
+      octets,
+      fichier.mimeType || "application/octet-stream",
+      nomPropre
+    );
+
+    const fichierDrive = dossierCandidat.createFile(blob);
+    resultat[code] = fichierDrive.getUrl();
+  });
+
+  return resultat;
+}
+
+function normaliserFichierPayload_(fichier) {
+  if (!fichier) return null;
+
+  if (typeof fichier === "string") {
+    return null;
+  }
+
+  const nom = nettoyerValeur_(
+    fichier.nom || fichier.name || fichier.filename
+  );
+  const mimeType = nettoyerValeur_(
+    fichier.mimeType || fichier.type || fichier.contentType
+  );
+  let base64 = nettoyerValeur_(
+    fichier.base64 || fichier.data || fichier.contenu
+  );
+
+  if (!nom || !base64) return null;
+
+  const marqueurBase64 = ";base64,";
+  const position = base64.indexOf(marqueurBase64);
+
+  if (position !== -1) {
+    base64 = base64.substring(position + marqueurBase64.length);
+  }
+
+  return {
+    nom: nom,
+    mimeType: mimeType,
+    base64: base64
+  };
+}
+
+function construireNomFichierPiece_(code, reference, nomOriginal) {
+  const extension = nomOriginal.indexOf(".") !== -1
+    ? "." + nomOriginal.split(".").pop().replace(/[^a-zA-Z0-9]/g, "")
+    : "";
+
+  const libelle = (CONFIG.LIBELLES_PIECES[code] || code)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+
+  return reference + "_" + libelle + extension;
+}
+
+function obtenirDossierCandidat_(
+  ecole,
+  campus,
+  typeAdmission,
+  reference,
+  nomComplet,
+  ressourcesFlux
+) {
+  const ressources = ressourcesFlux || obtenirRessourcesFlux_(ecole, typeAdmission);
+  verifierIdConfigure_(ressources.DOSSIER_DRIVE_ID, "DOSSIER_DRIVE_ID", ecole + " / " + typeAdmission);
+
+  const racine = DriveApp.getFolderById(ressources.DOSSIER_DRIVE_ID);
+  const annee = Utilities.formatDate(new Date(), CONFIG.FUSEAU_HORAIRE, "yyyy");
+  const dossierAnnee = obtenirOuCreerDossier_(racine, "Admissions " + annee);
+  const dossierCampus = obtenirOuCreerDossier_(dossierAnnee, campus);
+  const dossierFlux = obtenirOuCreerDossier_(dossierCampus, typeAdmission);
+  const nomDossier = reference + " - " + nettoyerNomDrive_(nomComplet);
+
+  return obtenirOuCreerDossier_(dossierFlux, nomDossier);
+}
+
+function obtenirOuCreerDossier_(parent, nom) {
+  const dossiers = parent.getFoldersByName(nom);
+  return dossiers.hasNext() ? dossiers.next() : parent.createFolder(nom);
+}
+
+function nettoyerNomDrive_(valeur) {
+  return nettoyerValeur_(valeur)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\\/:*?"<>|#%{}~]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 120) || "CANDIDAT";
+}
+
+function detecterPiecesManquantes_(typeAdmission, liens, handicap) {
+  const obligations = (CONFIG.PIECES_OBLIGATOIRES[typeAdmission] || []).slice();
+
+  if (normaliserTexte_(handicap) === "OUI") {
+    obligations.push("JUSTIFICATIF_HANDICAP");
+  }
+
+  return obligations.filter(function(code) {
+    return !nettoyerValeur_(liens[code]);
+  });
+}
+
+
+// ============================================================================
+// 13 BIS. CODE RNCP SAISI MANUELLEMENT DANS LA LIGNE DU CANDIDAT
+// ============================================================================
+
+/**
+ * Le code RNCP n'est recherché dans aucune base externe.
+ * L'équipe admissions le renseigne directement dans la colonne « CODE RNCP »
+ * de la ligne du candidat avant de lancer le publipostage.
+ */
+function obtenirDonneesRncp_(candidat) {
+  const codeDirect = nettoyerValeur_(candidat.code_rncp || "");
+
+  if (!codeDirect) {
+    throw new Error(
+      "Le champ « CODE RNCP » est vide sur la ligne du candidat. " +
+      "Renseignez-le manuellement dans le tableau avant de générer la lettre."
+    );
+  }
+
+  return {
+    code: codeDirect,
+    source: "LIGNE_CANDIDAT"
+  };
+}
+
+function verifierCodeRncpSelectionne() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+    const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+    const resultat = obtenirDonneesRncp_(candidat);
+
+    ui.alert(
+      "Code RNCP de la ligne",
+      "Formation : " + candidat.formation +
+      "\nCycle : " + candidat.cycle +
+      "\nNiveau : " + candidat.niveau_academique +
+      "\nDomaine : " + candidat.domaine +
+      "\nCode RNCP : " + resultat.code,
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Code RNCP manquant", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+// Alias conservé pour les anciennes installations et le panneau existant.
+function testerBaseRncpSelectionnee() {
+  verifierCodeRncpSelectionne();
+}
+
+function obtenirCodeRncpCandidatSelectionne() {
+  try {
+    const contexte = obtenirContexteSelection_();
+    const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+    const resultat = obtenirDonneesRncp_(candidat);
+
+    return {
+      success: true,
+      code_rncp: resultat.code,
+      source: resultat.source,
+      formation: candidat.formation,
+      cycle: candidat.cycle,
+      niveau_academique: candidat.niveau_academique,
+      domaine: candidat.domaine
+    };
+  } catch (erreur) {
+    return {
+      success: false,
+      message: erreur.message
+    };
+  }
+}
+
+// ============================================================================
+// 14. MENU ET PANNEAU DE VALIDATION DANS GOOGLE SHEETS
+// ============================================================================
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  // ==========================================================
+  // MENU 1 : ENVOI ET VALIDATION
+  // ==========================================================
+  ui.createMenu("📤 ENVOI & VALIDATION")
+    .addItem(
+      "Valider le dossier — une ligne",
+      "validerAdmissionSelectionneeDepuisMenu"
+    )
+    .addItem(
+      "Valider les dossiers — lignes sélectionnées",
+      "envoyerLettresAdmissionSelectionnees"
+    )
+    .addSeparator()
+    .addItem(
+      "Notifier les dossiers non conformes — sélection",
+      "notifierDossiersNonConformesSelectionnes"
+    )
+    .addSeparator()
+    .addItem(
+      "Régénérer et renvoyer le lien — une ligne",
+      "regenererEtRenvoyerLienSignatureSelectionnee"
+    )
+    .addItem(
+      "Révoquer le lien de signature — une ligne",
+      "revoquerSignatureSelectionnee"
+    )
+    .addToUi();
+
+  // ==========================================================
+  // MENU 2 : DOSSIERS ET CONTRÔLES
+  // ==========================================================
+  ui.createMenu("📂 DOSSIERS & CONTRÔLES")
+    .addItem(
+      "Ouvrir le panneau détaillé — une ligne",
+      "ouvrirPanneauAdmissions"
+    )
+    .addSeparator()
+    .addItem(
+      "Auditer les pièces — lignes sélectionnées",
+      "reanalyserPiecesSelectionneesEnLot"
+    )
+    .addItem(
+      "Vérifier le code RNCP — une ligne",
+      "verifierCodeRncpSelectionne"
+    )
+    .addSeparator()
+    .addItem(
+      "Tester le modèle de la ligne sélectionnée",
+      "testerModeleAdmissionSelectionne"
+    )
+    .addItem(
+      "Auditer les modèles et dossiers",
+      "auditerConfigurationModelesAdmissions"
+    )
+    .addToUi();
+
+  // ==========================================================
+  // MENU 3 : PARAMÈTRES
+  // ==========================================================
+  ui.createMenu("⚙️ PARAMÈTRES")
+    .addItem(
+      "Configurer l’URL du portail",
+      "configurerUrlPortailSignature"
+    )
+    .addItem(
+      "Réinitialiser le secret de signature",
+      "reinitialiserSecretSignature"
+    )
+    .addSeparator()
+    .addItem(
+      "Installer les colonnes — onglet actif",
+      "installerColonnesSignatureInterneOngletActif"
+    )
+    .addItem(
+      "Installer les colonnes — tous les Sheets nationaux",
+      "installerColonnesSignatureInterneTousSheetsNationaux"
+    )
+    .addSeparator()
+    .addItem(
+      "Autoriser les services Google",
+      "autoriserServicesSignatureInterne"
+    )
+    .addToUi();
+
+  // ==========================================================
+  // MENU 4 : TESTS ET DIAGNOSTICS
+  // ==========================================================
+  ui.createMenu("🧪 TESTS & DIAGNOSTICS")
+    .addItem(
+      "Tester le portail configuré",
+      "testerPortailConfigure"
+    )
+    .addItem(
+      "Tester l’URL du portail de signature",
+      "testerPortailSignatureInterne"
+    )
+    .addSeparator()
+    .addItem(
+      "Diagnostiquer le panneau et la signature",
+      "diagnostiquerPanneauEtSignature"
+    )
+    .addItem(
+      "Diagnostiquer le déploiement public",
+      "diagnostiquerDeploiementSignature"
+    )
+    .addSeparator()
+    .addItem(
+      "Tester le fichier du panneau HTML",
+      "testerFichierPanneauAdmissions"
+    )
+    .addItem(
+      "Tester la génération PDF — une ligne",
+      "testerGenerationPdfSelectionneeV4"
+    )
+    .addSeparator()
+    .addItem(
+      "Afficher la version du backend",
+      "afficherVersionBackendV6"
+    )
+    .addToUi();
+}
+
+function afficherVersionBackendV6() {
+  SpreadsheetApp.getUi().alert(
+    "Backend hybride actif",
+    "Version chargée : " + CONFIG.VERSION +
+      "\n\nFrance / NATIONAL : PDF + lien privé + OTP e-mail + signature manuscrite." +
+      "\nHors France / INTERNATIONAL : lettre PDF envoyée directement par e-mail." +
+      "\n\nAucun service de signature payant et aucune publicité.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+
+// Alias conservé pour les anciens menus ou boutons.
+function afficherVersionBackendV5() {
+  afficherVersionBackendV6();
+}
+
+/**
+ * À exécuter une fois depuis l'éditeur Apps Script pour accepter les droits
+ * Drive, Docs, MailApp et URL Fetch nécessaires à l'export PDF.
+ */
+function autoriserServicesPdfV4() {
+  DriveApp.getRootFolder().getName();
+  MailApp.getRemainingDailyQuota();
+  ScriptApp.getOAuthToken();
+  UrlFetchApp.fetch("https://docs.google.com", {
+    method: "get",
+    muteHttpExceptions: true
+  });
+
+  SpreadsheetApp.getUi().alert(
+    "Autorisation terminée",
+    "Drive, Docs, l'envoi d'e-mails et URL Fetch sont autorisés.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+
+/**
+ * Génère le PDF de la ligne active sans envoyer d'e-mail. Le PDF est conservé
+ * dans le dossier du candidat et son URL est affichée pour diagnostic.
+ */
+function testerGenerationPdfSelectionneeV4() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+    const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+    const donneesRncp = obtenirDonneesRncp_(candidat);
+    candidat.code_rncp = donneesRncp.code;
+    candidat.niveau_academique = candidat.niveau_academique || candidat.cycle || "";
+    candidat.domaine = candidat.domaine || "";
+    candidat.rythme_academique = candidat.rythme_academique || candidat.rythme || "";
+    const ressources = obtenirRessourcesEcole_(contexte.ecole);
+    const ressourcesFlux = obtenirRessourcesFlux_(contexte.ecole, contexte.typeAdmission);
+    const reference = candidat.reference_dossier ||
+      genererReferenceDossier_(contexte.ecole, contexte.campus);
+    const dossierCandidat = obtenirDossierCandidat_(
+      contexte.ecole,
+      contexte.campus,
+      contexte.typeAdmission,
+      reference,
+      candidat.nom_complet,
+      ressourcesFlux
+    );
+
+    const lettre = genererLettreAdmission_(candidat, {
+      ecole: contexte.ecole,
+      campus: contexte.campus,
+      typeAdmission: contexte.typeAdmission,
+      reference: reference,
+      ressources: ressources,
+      ressourcesFlux: ressourcesFlux,
+      dossierCandidat: dossierCandidat
+    });
+
+    ui.alert(
+      "PDF généré avec succès",
+      "Version : " + CONFIG.VERSION +
+        "\nPDF : " + lettre.pdfFile.getUrl() +
+        "\nCopie Docs : " + lettre.documentFile.getUrl(),
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert(
+      "Échec du test PDF — " + CONFIG.VERSION,
+      erreur.message,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/**
+ * Charge le panneau HTML en acceptant les noms rencontrés dans les packs.
+ * Le nom recommandé dans Apps Script reste exactement : PanneauAdmissions
+ * (l'éditeur ajoute automatiquement l'extension .html).
+ */
+function chargerPanneauAdmissions_() {
+  const nomsPossibles = [
+    "PanneauAdmissions",
+    "PanneauAdmissions(3)",
+    "PanneauAdmissions_3",
+    "Sidebar"
+  ];
+
+  const erreurs = [];
+
+  for (let i = 0; i < nomsPossibles.length; i++) {
+    const nom = nomsPossibles[i];
+
+    try {
+      return {
+        nom: nom,
+        html: HtmlService.createHtmlOutputFromFile(nom)
+      };
+    } catch (erreur) {
+      erreurs.push(nom + " : " + erreur.message);
+    }
+  }
+
+  throw new Error(
+    "Aucun fichier HTML compatible n'a été trouvé dans CE projet Apps Script.\n\n" +
+    "Dans l'éditeur Apps Script :\n" +
+    "1. Cliquez sur + puis HTML.\n" +
+    "2. Donnez exactement le nom PanneauAdmissions, sans écrire .html.\n" +
+    "3. Collez le contenu du fichier PanneauAdmissions.html.\n" +
+    "4. Enregistrez puis actualisez le Google Sheet.\n\n" +
+    "Noms testés : " + nomsPossibles.join(", ") + ".\n\n" +
+    "Détails techniques :\n" + erreurs.join("\n")
+  );
+}
+
+function ouvrirPanneauAdmissions() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const panneau = chargerPanneauAdmissions_();
+    const html = panneau.html
+      .setTitle("Validation du dossier")
+      .setWidth(420);
+
+    ui.showSidebar(html);
+  } catch (erreur) {
+    ui.alert(
+      "Panneau HTML introuvable",
+      erreur.message,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function testerFichierPanneauAdmissions() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const panneau = chargerPanneauAdmissions_();
+
+    ui.alert(
+      "Panneau HTML détecté",
+      "Le fichier utilisé est : " + panneau.nom + ".html\n\n" +
+      "Le panneau peut maintenant être ouvert depuis le menu Admissions.",
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert(
+      "Panneau HTML introuvable",
+      erreur.message,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function initialiserOngletAdmissionsActif() {
+  SpreadsheetApp.getUi().alert(
+    "Mode strict activé",
+    "Le backend ne crée plus aucun onglet, aucune colonne et aucune ligne. Il utilise uniquement la structure existante.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+function obtenirCandidatSelectionne() {
+  try {
+    const contexte = obtenirContexteSelection_();
+    const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+    const liens = extraireLiensPiecesLigne_(candidat);
+    const pieces = construireEtatPieces_(
+      contexte.typeAdmission,
+      liens,
+      candidat.handicap
+    );
+
+    return {
+      success: true,
+      candidat: {
+        ligne: contexte.ligne,
+        ecole: contexte.ecole,
+        campus: contexte.campus,
+        typeAdmission: contexte.typeAdmission,
+        reference: candidat.reference_dossier,
+        nomComplet: candidat.nom_complet || [candidat.nom, candidat.prenom].filter(Boolean).join(" "),
+        email: candidat.email,
+        formation: candidat.formation,
+        niveauAcademique: candidat.niveau_academique,
+        domaine: candidat.domaine,
+        rythmeAcademique: candidat.rythme_academique,
+        codeRncp: candidat.code_rncp || "",
+        statut: candidat.statut,
+        statutSignature: candidat.statut_signature || "",
+        idDemandeSignature: candidat.id_demande_signature || "",
+        dateSignature: candidat.date_signature || "",
+        lienPdfSigne: candidat.lien_pdf_signe || "",
+        modeTraitement: normaliserTexte_(contexte.typeAdmission) === "NATIONAL"
+          ? "SIGNATURE_INTERNE_OTP"
+          : "ENVOI_DIRECT_EMAIL",
+        libelleAction: normaliserTexte_(contexte.typeAdmission) === "NATIONAL"
+          ? "Générer et envoyer pour signature"
+          : "Générer et envoyer la lettre",
+        pieces: pieces
+      }
+    };
+  } catch (erreur) {
+    return {
+      success: false,
+      message: erreur.message
+    };
+  }
+}
+
+function construireEtatPieces_(typeAdmission, liens, handicap) {
+  const obligatoires = (CONFIG.PIECES_OBLIGATOIRES[typeAdmission] || []).slice();
+
+  if (normaliserTexte_(handicap) === "OUI") {
+    obligatoires.push("JUSTIFICATIF_HANDICAP");
+  }
+
+  const ordre = [
+    "CV",
+    "DIPLOME",
+    "PIECE_IDENTITE",
+    "CARTE_VITALE",
+    "JUSTIFICATIF_HANDICAP"
+  ];
+
+  return ordre.map(function(code) {
+    return {
+      code: code,
+      libelle: CONFIG.LIBELLES_PIECES[code] || code,
+      obligatoire: obligatoires.indexOf(code) !== -1,
+      present: Boolean(nettoyerValeur_(liens[code])),
+      lien: liens[code] || ""
+    };
+  }).filter(function(piece) {
+    return piece.obligatoire || piece.present;
+  });
+}
+
+function validerAdmissionSelectionneeDepuisMenu() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+    const national = normaliserTexte_(contexte.typeAdmission) === "NATIONAL";
+    const confirmation = ui.alert(
+      national ? "Admission nationale — signature électronique" : "Admission internationale — envoi direct",
+      national
+        ? "Générer la lettre PDF et envoyer le lien privé de signature avec vérification OTP ?"
+        : "Générer la lettre PDF et l’envoyer directement à l’étudiant par e-mail, sans prestataire externe ?",
+      ui.ButtonSet.YES_NO
+    );
+
+    if (confirmation !== ui.Button.YES) return;
+
+    const resultat = validerEtEnvoyerAdmissionSelectionnee();
+    ui.alert(
+      national ? "Demande de signature envoyée" : "Lettre d’admission envoyée",
+      resultat.message +
+        "\nRéférence : " + resultat.reference_dossier +
+        (resultat.id_demande_signature ? "\nID demande interne : " + resultat.id_demande_signature : ""),
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Erreur", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Point d'entrée administratif unique.
+ * NATIONAL      -> portail interne OTP + signature manuscrite.
+ * INTERNATIONAL -> envoi direct du PDF par Gmail.
+ */
+function validerEtEnvoyerAdmissionSelectionnee() {
+  const contexte = obtenirContexteSelection_();
+  const flux = normaliserTexte_(contexte.typeAdmission);
+
+  if (flux === "NATIONAL") {
+    return validerEtEnvoyerAdmissionNationale_(contexte);
+  }
+
+  if (flux === "INTERNATIONAL") {
+    return validerEtEnvoyerAdmissionInternationale_(contexte);
+  }
+
+  throw new Error(
+    "Type d'admission non reconnu : " + (contexte.typeAdmission || "valeur vide") + "."
+  );
+}
+
+function preparerAdmissionSelectionnee_(contexte) {
+  const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+  const liens = extraireLiensPiecesLigne_(candidat);
+  const manquantes = detecterPiecesManquantes_(
+    contexte.typeAdmission,
+    liens,
+    candidat.handicap
+  );
+
+  if (manquantes.length > 0 && !CONFIG.AUTORISER_VALIDATION_DOSSIER_INCOMPLET) {
+    throw new Error(
+      "Validation bloquée. Pièces obligatoires manquantes : " +
+      manquantes.map(function(code) {
+        return CONFIG.LIBELLES_PIECES[code] || code;
+      }).join(", ") + "."
+    );
+  }
+
+  if (!emailValide_(candidat.email)) {
+    throw new Error("L'adresse e-mail du candidat est absente ou invalide.");
+  }
+
+  const donneesRncp = obtenirDonneesRncp_(candidat);
+  candidat.code_rncp = donneesRncp.code;
+  candidat.niveau_academique = candidat.niveau_academique || candidat.cycle || "";
+  candidat.domaine = candidat.domaine || "";
+  candidat.rythme_academique = candidat.rythme_academique || candidat.rythme || "";
+
+  const ressources = obtenirRessourcesEcole_(contexte.ecole);
+  const ressourcesFlux = obtenirRessourcesFlux_(
+    contexte.ecole,
+    contexte.typeAdmission
+  );
+  verifierIdConfigure_(
+    ressourcesFlux.TEMPLATE_ID,
+    "TEMPLATE_" + contexte.typeAdmission + "_ID",
+    contexte.ecole
+  );
+  verifierIdConfigure_(
+    ressourcesFlux.DOSSIER_DRIVE_ID,
+    "DOSSIER_DRIVE_ID",
+    contexte.ecole + " / " + contexte.typeAdmission
+  );
+
+  const reference = candidat.reference_dossier ||
+    genererReferenceDossier_(contexte.ecole, contexte.campus);
+
+  const dossierCandidat = obtenirDossierCandidat_(
+    contexte.ecole,
+    contexte.campus,
+    contexte.typeAdmission,
+    reference,
+    candidat.nom_complet,
+    ressourcesFlux
+  );
+
+  const contexteLettre = {
+    ecole: contexte.ecole,
+    campus: contexte.campus,
+    typeAdmission: contexte.typeAdmission,
+    reference: reference,
+    ressources: ressources,
+    ressourcesFlux: ressourcesFlux,
+    dossierCandidat: dossierCandidat
+  };
+
+  const lettre = genererLettreAdmission_(candidat, contexteLettre);
+
+  return {
+    candidat: candidat,
+    ressources: ressources,
+    ressourcesFlux: ressourcesFlux,
+    reference: reference,
+    dossierCandidat: dossierCandidat,
+    contexteLettre: contexteLettre,
+    lettre: lettre
+  };
+}
+
+function verifierColonnesSignatureNationale_(feuille) {
+  const colonnes = synchroniserColonnes_(feuille);
+  const obligatoires = obtenirClesColonnesSignatureInterne_();
+  const absentes = obligatoires.filter(function(cle) {
+    return !colonnes[cle];
+  });
+
+  if (absentes.length > 0) {
+    const titres = absentes.map(function(cle) {
+      const champ = CHAMPS.filter(function(item) { return item.cle === cle; })[0];
+      return champ ? champ.titre : cle;
+    });
+    throw new Error(
+      "Colonnes de signature interne absentes dans l'onglet " + feuille.getName() +
+      " : " + titres.join(", ") +
+      ". Utilisez le menu « Installer les colonnes — onglet actif »."
+    );
+  }
+}
+
+function validerEtEnvoyerAdmissionNationale_(contexte) {
+  verifierColonnesSignatureNationale_(contexte.feuille);
+  const candidatAvant = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+  const statutAvant = normaliserStatutSignature_(candidatAvant.statut_signature);
+
+  if (["EN ATTENTE DE SIGNATURE", "CONSULTÉ", "FINALISATION EN COURS", "SIGNÉ"].indexOf(statutAvant) !== -1) {
+    throw new Error(
+      "Une demande de signature existe déjà pour ce dossier. " +
+      "Utilisez la fonction de relance ou révoquez le lien existant."
+    );
+  }
+
+  const preparation = preparerAdmissionSelectionnee_(contexte);
+  const maintenant = formaterDate_(new Date());
+  const validateur = Session.getActiveUser().getEmail() || "Utilisateur Apps Script";
+  const demande = creerDemandeSignatureInterne_(
+    contexte,
+    preparation.candidat,
+    preparation.reference,
+    preparation.lettre
+  );
+
+  mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+    reference_dossier: preparation.reference,
+    statut: "ADMIS - EN ATTENTE DE SIGNATURE",
+    motif_non_conformite: "",
+    pieces_manquantes: "",
+    lien_pdf_lettre: preparation.lettre.pdfFile.getUrl(),
+    code_rncp: preparation.candidat.code_rncp,
+    date_decision: maintenant,
+    valide_par: validateur,
+    statut_signature: "EN ATTENTE DE SIGNATURE",
+    id_demande_signature: demande.idDemande,
+    id_document_signature: preparation.lettre.documentFile.getId(),
+    id_signataire: demande.idSignataire,
+    id_fichier_pdf_original: preparation.lettre.pdfFile.getId(),
+    date_envoi_signature: maintenant,
+    date_signature: "",
+    date_consultation_signature: "",
+    expiration_signature: demande.expirationIso,
+    lien_signature: demande.lienSignature,
+    token_signature_hash: demande.tokenHash,
+    otp_signature_hash: "",
+    otp_expiration: "",
+    otp_tentatives: 0,
+    date_derniere_otp: "",
+    lien_pdf_signe: "",
+    lien_dossier_preuve: "",
+    niveau_signature: "INTERNE - OTP EMAIL + SIGNATURE MANUSCRITE",
+    consentement_signature: "",
+    user_agent_signature: "",
+    empreinte_pdf_original: demande.empreintePdfOriginal,
+    empreinte_pdf_signe: "",
+    id_fichier_signature_image: "",
+    id_evenement_signature: "",
+    derniere_relance_signature: "",
+    erreur_signature: ""
+  });
+
+  try {
+    envoyerEmailDemandeSignatureInterne_(
+      preparation.candidat,
+      {
+        ecole: contexte.ecole,
+        campus: contexte.campus,
+        reference: preparation.reference,
+        nomExpediteur: preparation.ressourcesFlux.NOM_EXPEDITEUR,
+        replyTo: preparation.ressourcesFlux.REPLY_TO
+      },
+      demande.lienSignature,
+      preparation.lettre.pdfBlob
+    );
+  } catch (erreurEmail) {
+    mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+      erreur_signature: "Lien créé, mais e-mail non envoyé : " + erreurEmail.message
+    });
+    throw new Error(
+      "La demande a été créée, mais l'e-mail n'a pas pu être envoyé : " +
+      erreurEmail.message
+    );
+  }
+
+  return {
+    success: true,
+    mode_traitement: "SIGNATURE_INTERNE_OTP",
+    message: "La lettre et le lien privé de signature ont été envoyés.",
+    reference_dossier: preparation.reference,
+    pdf_url: preparation.lettre.pdfFile.getUrl(),
+    email: preparation.candidat.email,
+    code_rncp: preparation.candidat.code_rncp,
+    id_demande_signature: demande.idDemande,
+    signature_link: demande.lienSignature,
+    statut_signature: "EN ATTENTE DE SIGNATURE"
+  };
+}
+
+function validerEtEnvoyerAdmissionInternationale_(contexte) {
+  const preparation = preparerAdmissionSelectionnee_(contexte);
+
+  envoyerEmailAdmission_(
+    preparation.candidat,
+    contexte,
+    preparation.reference,
+    preparation.lettre.pdfBlob,
+    preparation.ressourcesFlux
+  );
+
+  const maintenant = formaterDate_(new Date());
+  const validateur = Session.getActiveUser().getEmail() || "Utilisateur Apps Script";
+
+  mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+    reference_dossier: preparation.reference,
+    statut: "ADMIS - LETTRE ENVOYÉE",
+    motif_non_conformite: "",
+    pieces_manquantes: "",
+    lien_pdf_lettre: preparation.lettre.pdfFile.getUrl(),
+    code_rncp: preparation.candidat.code_rncp,
+    date_decision: maintenant,
+    date_email: maintenant,
+    valide_par: validateur,
+    statut_signature: "NON APPLICABLE - INTERNATIONAL",
+    erreur_signature: ""
+  });
+
+  return {
+    success: true,
+    mode_traitement: "ENVOI_DIRECT_EMAIL",
+    message: "La lettre d'admission a été envoyée directement par e-mail.",
+    reference_dossier: preparation.reference,
+    pdf_url: preparation.lettre.pdfFile.getUrl(),
+    email: preparation.candidat.email,
+    code_rncp: preparation.candidat.code_rncp,
+    statut_signature: "NON APPLICABLE - INTERNATIONAL"
+  };
+}
+
+function genererLettreAdmission_(candidat, contexte) {
+  let copie = null;
+  let etape = "initialisation";
+
+  try {
+    etape = "lecture du modèle Google Docs";
+    const template = executerAvecRelance_(
+      function() {
+        return DriveApp.getFileById(
+          contexte.ressourcesFlux.TEMPLATE_ID
+        );
+      },
+      3,
+      800,
+      "Accès au modèle Google Docs"
+    );
+
+    if (template.getMimeType() !== MimeType.GOOGLE_DOCS) {
+      throw new Error(
+        "Le modèle n'est pas un Google Docs natif. Type détecté : " +
+        template.getMimeType()
+      );
+    }
+
+    const nomComplet = nettoyerValeur_(candidat.nom_complet) ||
+      [candidat.nom, candidat.prenom].filter(Boolean).join(" ") ||
+      "CANDIDAT";
+
+    const nomFichier =
+      "LETTRE_ADMISSION_" +
+      contexte.typeAdmission + "_" +
+      contexte.reference +
+      "_" +
+      nettoyerNomDrive_(nomComplet).replace(/\s+/g, "_");
+
+    etape = "création de la copie du modèle";
+    copie = executerAvecRelance_(
+      function() {
+        const nouvelleCopie = template.makeCopy(
+          nomFichier,
+          contexte.dossierCandidat
+        );
+        // Force une lecture réelle de la copie avant de continuer.
+        nouvelleCopie.getName();
+        return nouvelleCopie;
+      },
+      4,
+      1000,
+      "Création de la copie du modèle"
+    );
+
+    const documentId = copie.getId();
+    Utilities.sleep(1200);
+
+    etape = "ouverture de la copie Google Docs";
+    const document = executerAvecRelance_(
+      function() {
+        return DocumentApp.openById(documentId);
+      },
+      6,
+      1200,
+      "Ouverture de la copie Google Docs"
+    );
+
+    const remplacements = {
+      "{{REFERENCE_DOSSIER}}": contexte.reference,
+      "{{REFERENCE}}": contexte.reference,
+      "{{NOM_COMPLET}}": nomComplet,
+      "{{Noms}}": nomComplet,
+      "{{NOM}}": candidat.nom,
+      "{{PRENOM}}": candidat.prenom,
+      "{{DATE_NAISSANCE}}": formaterDateSimple_(candidat.date_naissance),
+      "{{DateNaissance}}": formaterDateSimple_(candidat.date_naissance),
+      "{{LIEU_NAISSANCE}}": candidat.lieu_naissance,
+      "{{LieuNaissance}}": candidat.lieu_naissance,
+      "{{FORMATION}}": candidat.formation,
+      "{{Formation}}": candidat.formation,
+      "{{CYCLE}}": candidat.cycle,
+      "{{NIVEAU}}": candidat.niveau_academique,
+      "{{NIVEAU_ACADEMIQUE}}": candidat.niveau_academique,
+      "{{DOMAINE}}": candidat.domaine,
+      "{{RYTHME}}": candidat.rythme_academique || candidat.rythme,
+      "{{RYTHME_ACADEMIQUE}}": candidat.rythme_academique || candidat.rythme,
+      "{{CODE_RNCP}}": candidat.code_rncp,
+      "{{CAMPUS}}": contexte.campus,
+      "{{TYPE_ADMISSION}}": contexte.typeAdmission,
+      "{{LIBELLE_TYPE_ADMISSION}}": contexte.typeAdmission === "NATIONAL"
+        ? "Admission nationale"
+        : "Admission internationale",
+      "{{SIGNATURE_REQUISE}}": contexte.typeAdmission === "NATIONAL" ? "OUI" : "NON",
+      "{{PROCEDURE_POST_ADMISSION}}": contexte.typeAdmission === "NATIONAL"
+        ? "Signature électronique interne par code OTP et signature manuscrite."
+        : "Envoi direct de la lettre et poursuite de la procédure internationale.",
+      "{{PAYS_RESIDENCE}}": candidat.pays_residence,
+      "{{VILLE}}": candidat.ville,
+      "{{ADRESSE}}": candidat.adresse,
+      "{{EMAIL}}": candidat.email,
+      "{{TELEPHONE}}": candidat.telephone,
+      "{{ECOLE}}": contexte.ecole,
+      "{{Ecole}}": contexte.ecole,
+      "{{DATE_DECISION}}": Utilities.formatDate(
+        new Date(),
+        CONFIG.FUSEAU_HORAIRE,
+        "dd/MM/yyyy"
+      )
+    };
+
+    etape = "remplacement des balises";
+    remplacerDansDocument_(document, remplacements);
+
+    etape = "enregistrement du Google Docs";
+    document.saveAndClose();
+
+    // saveAndClose() force les modifications en attente. On laisse ensuite
+    // le temps au service Docs de rendre la nouvelle version exportable.
+    Utilities.sleep(2500);
+
+    etape = "conversion du Google Docs en PDF";
+    const pdfConverti = exporterDocumentGoogleEnPdfV4_(
+      documentId,
+      nomFichier + ".pdf"
+    );
+
+    etape = "enregistrement du PDF dans Drive";
+    const pdfFile = executerAvecRelance_(
+      function() {
+        const fichierPdf = contexte.dossierCandidat.createFile(
+          pdfConverti.copyBlob().setName(nomFichier + ".pdf")
+        );
+        fichierPdf.getSize();
+        return fichierPdf;
+      },
+      4,
+      1000,
+      "Enregistrement du PDF dans Drive"
+    );
+
+    // On ne transmet pas à Gmail le blob de conversion, qui peut rester lié
+    // au document source. On relit le vrai fichier PDF binaire créé dans Drive.
+    etape = "lecture binaire du PDF enregistré";
+    const pdfBlobEmail = executerAvecRelance_(
+      function() {
+        const fichierPdfActualise = DriveApp.getFileById(pdfFile.getId());
+        const blob = fichierPdfActualise.getBlob()
+          .setContentType(MimeType.PDF)
+          .setName(nomFichier + ".pdf");
+
+        if (!blob || blob.getBytes().length === 0) {
+          throw new Error("Le fichier PDF enregistré est vide.");
+        }
+
+        return blob;
+      },
+      5,
+      1000,
+      "Lecture du PDF enregistré"
+    );
+
+    // La copie Google Docs est supprimée seulement après création et relecture
+    // réussies du PDF. Elle reste disponible en cas de diagnostic.
+    if (!CONFIG.CONSERVER_DOCUMENT_GOOGLE && contexte.typeAdmission !== "NATIONAL") {
+      try {
+        copie.setTrashed(true);
+      } catch (erreurSuppression) {
+        console.warn(
+          "La copie Google Docs n'a pas pu être supprimée : " +
+          erreurSuppression.message
+        );
+      }
+    }
+
+    return {
+      documentFile: copie,
+      pdfFile: pdfFile,
+      pdfBlob: pdfBlobEmail
+    };
+  } catch (erreur) {
+    const idCopie = copie ? copie.getId() : "aucune copie créée";
+    const urlCopie = copie
+      ? "https://docs.google.com/document/d/" + copie.getId() + "/edit"
+      : "aucune";
+
+    throw new Error(
+      "Échec à l'étape « " + etape + " » : " +
+      erreur.message +
+      ". ID de la copie : " + idCopie +
+      ". URL de contrôle : " + urlCopie
+    );
+  }
+}
+
+/**
+ * Exécute une opération susceptible d'échouer temporairement et la relance.
+ * Ceci corrige les délais de synchronisation entre DriveApp et DocumentApp.
+ */
+function executerAvecRelance_(operation, nombreTentatives, attenteInitialeMs, libelle) {
+  let derniereErreur = null;
+
+  for (let tentative = 1; tentative <= nombreTentatives; tentative++) {
+    try {
+      return operation();
+    } catch (erreur) {
+      derniereErreur = erreur;
+      console.warn(
+        libelle + " — tentative " + tentative + "/" + nombreTentatives +
+        " : " + erreur.message
+      );
+
+      if (tentative < nombreTentatives) {
+        Utilities.sleep(attenteInitialeMs * tentative);
+      }
+    }
+  }
+
+  throw new Error(
+    libelle + " impossible après " + nombreTentatives +
+    " tentative(s) : " +
+    (derniereErreur ? derniereErreur.message : "erreur inconnue")
+  );
+}
+
+/**
+ * Exporte un Google Docs en PDF avec trois méthodes successives.
+ * 1. DocumentApp.getAs() ; 2. DriveApp.getAs() ; 3. URL d'export Docs.
+ * La troisième méthode utilise le jeton OAuth du script, sans compte de
+ * service et sans configuration manuelle dans Google Cloud.
+ */
+function exporterDocumentGoogleEnPdfV4_(documentId, nomPdf) {
+  const erreurs = [];
+
+  // Méthode 1 : export depuis le service Google Docs.
+  try {
+    return executerAvecRelance_(
+      function() {
+        const document = DocumentApp.openById(documentId);
+        const blob = document.getAs(MimeType.PDF).setName(nomPdf);
+
+        if (!blob || blob.getBytes().length === 0) {
+          throw new Error("DocumentApp a retourné un PDF vide.");
+        }
+
+        return blob;
+      },
+      3,
+      1500,
+      "Export PDF par DocumentApp"
+    );
+  } catch (erreurDocumentApp) {
+    erreurs.push("DocumentApp : " + erreurDocumentApp.message);
+  }
+
+  // Méthode 2 : export depuis le fichier Drive.
+  try {
+    return executerAvecRelance_(
+      function() {
+        const fichier = DriveApp.getFileById(documentId);
+        const blob = fichier.getAs(MimeType.PDF).setName(nomPdf);
+
+        if (!blob || blob.getBytes().length === 0) {
+          throw new Error("DriveApp a retourné un PDF vide.");
+        }
+
+        return blob;
+      },
+      3,
+      1800,
+      "Export PDF par DriveApp"
+    );
+  } catch (erreurDriveApp) {
+    erreurs.push("DriveApp : " + erreurDriveApp.message);
+  }
+
+  // Méthode 3 : téléchargement de l'export PDF via le serveur Google Docs.
+  try {
+    return executerAvecRelance_(
+      function() {
+        const url =
+          "https://docs.google.com/document/d/" +
+          encodeURIComponent(documentId) +
+          "/export?format=pdf";
+
+        const reponse = UrlFetchApp.fetch(url, {
+          method: "get",
+          headers: {
+            Authorization: "Bearer " + ScriptApp.getOAuthToken()
+          },
+          followRedirects: true,
+          muteHttpExceptions: true
+        });
+
+        const code = reponse.getResponseCode();
+        const typeContenu = String(
+          reponse.getHeaders()["Content-Type"] ||
+          reponse.getHeaders()["content-type"] ||
+          ""
+        ).toLowerCase();
+
+        if (code !== 200) {
+          throw new Error(
+            "Réponse HTTP " + code + " : " +
+            reponse.getContentText().substring(0, 300)
+          );
+        }
+
+        const blob = reponse.getBlob()
+          .setContentType(MimeType.PDF)
+          .setName(nomPdf);
+
+        if (!blob || blob.getBytes().length === 0) {
+          throw new Error("L'URL d'export a retourné un fichier vide.");
+        }
+
+        if (typeContenu && typeContenu.indexOf("pdf") === -1) {
+          throw new Error(
+            "Le serveur a renvoyé « " + typeContenu + " » au lieu d'un PDF."
+          );
+        }
+
+        return blob;
+      },
+      4,
+      2000,
+      "Export PDF par URL Google Docs"
+    );
+  } catch (erreurUrl) {
+    erreurs.push("URL Google Docs : " + erreurUrl.message);
+  }
+
+  throw new Error(
+    "Les trois méthodes de conversion ont échoué. " + erreurs.join(" | ")
+  );
+}
+
+
+function remplacerDansDocument_(document, remplacements) {
+  const elements = [
+    document.getBody(),
+    document.getHeader(),
+    document.getFooter()
+  ].filter(function(element) {
+    return element !== null;
+  });
+
+  Object.keys(remplacements).forEach(function(balise) {
+    const valeur = nettoyerValeur_(remplacements[balise]);
+
+    elements.forEach(function(element) {
+      element.replaceText(echapperExpressionReguliere_(balise), valeur);
+    });
+  });
+}
+
+function envoyerEmailAdmission_(candidat, contexte, reference, pdfBlob, ressources) {
+  if (!pdfBlob || typeof pdfBlob.getBytes !== "function") {
+    throw new Error("Le PDF généré est absent ou invalide.");
+  }
+  if (pdfBlob.getBytes().length === 0) {
+    throw new Error("Le PDF généré est vide.");
+  }
+
+  const nom = nettoyerValeur_(candidat.nom_complet) || "Candidat(e)";
+  const formation = nettoyerValeur_(candidat.formation);
+  const niveau = nettoyerValeur_(candidat.niveau_academique);
+  const domaine = nettoyerValeur_(candidat.domaine);
+  const rythme = nettoyerValeur_(candidat.rythme_academique || candidat.rythme);
+  const campus = nettoyerValeur_(contexte.campus);
+  const codeRncp = nettoyerValeur_(candidat.code_rncp) || "NON RENSEIGNÉ";
+  const objet = CONFIG.OBJET_EMAIL_ADMISSION;
+
+  const texte =
+    "Bonjour " + nom + ",\n\n" +
+    "Suite à votre candidature, nous avons le plaisir de vous annoncer votre admission au sein de notre établissement ! Vous trouverez en pièce jointe votre lettre d'admission.\n\n" +
+    "Voici le récapitulatif de votre cursus :\n" +
+    "• Formation : " + formation + "\n" +
+    "• Niveau : " + niveau + "\n" +
+    "• Domaine : " + domaine + "\n" +
+    "• Rythme : " + rythme + "\n" +
+    "• Campus d'affectation : " + campus + "\n\n" +
+    "1. Certification RNCP\n" +
+    "Votre formation est reconnue par l'État. Voici le code RNCP correspondant : " + codeRncp + ".\n" +
+    "NB : Les BTS / DCG / DSCG sont des diplômes d’État relevant du Ministère de l’Éducation nationale et préparés par l’ensemble des écoles agréées.\n\n" +
+    "Pour vérifier si ce code RNCP est bien actif et appartient à notre école, merci de visionner la vidéo explicative suivante : " + CONFIG.VIDEO_RNCP_URL + "\n\n" +
+    "2. Modalités de paiement\n" +
+    "Pour procéder au paiement, vous disposez de 5 options :\n" +
+    "• Virement bancaire (RIB en pièce jointe ou au bas de votre lettre d'admission).\n" +
+    "• Carte bancaire sur le site internet de l’école (rubrique Inscriptions).\n" +
+    "• Sur place dans l'un de nos campus (Torcy, Évry, Lyon et Noisiel).\n" +
+    "• Transfert de fonds (Orange Money, Western Union, MoneyGram, Ria, etc.). L'identité de la personne bénéficiaire vous sera communiquée sur demande.\n" +
+    "• PayPal via le site internet de l’école, si vous disposez d’un compte.\n\n" +
+    "3. Documents à retourner pour l'attestation d'inscription\n" +
+    "Afin de finaliser votre inscription et de recevoir votre attestation, nous vous invitons à procéder au règlement d'un montant total de 2 000 € (comprenant 1 000 € de frais d'inscription et 1 000 € d'acompte sur les frais de scolarité).\n\n" +
+    "Vous devez conjointement nous retourner :\n" +
+    "• La preuve de paiement des frais d'inscription (1 000 €).\n" +
+    "• La preuve du paiement de l'acompte des frais de scolarité (minimum de 1 000 €).\n" +
+    "• L'attestation sur l’honneur de souscription à l’offre d’A.V.I. de notre partenaire MBN Global Finance, dûment signée.\n" +
+    "• Votre lettre d’admission.\n" +
+    "• Les conditions générales de vente de l'école signées, précédées de la mention Lu et approuvé.\n\n" +
+    "4. Conditions de remboursement et refus de visa\n" +
+    "• L'acompte des frais de scolarité (minimum 1 000 €) est remboursable à 100 % en cas de refus de visa.\n" +
+    "• Les frais d'inscription (1 000 €) ne sont pas remboursables, quel que soit le motif invoqué.\n\n" +
+    "Note en cas de refus : Si votre demande de visa est refusée une première fois, votre inscription reste valable pour une deuxième demande et une nouvelle attestation vous sera délivrée. Si votre deuxième demande est également refusée, vous devrez vous acquitter de nouveau de 1 000 € de frais d'inscription pour obtenir une nouvelle attestation.\n\n" +
+    "5. A.V.I. (Caution Bancaire Étudiante)\n" +
+    "Une caution bancaire est proposée dans le cadre d’un partenariat avec MBN GLOBAL FINANCE. Elle n’est pas obligatoire, mais fortement recommandée. Les financements des cautions bancaires sont valables pour deux rentrées, au même titre que les attestations d’inscription.\n\n" +
+    "6. Engagement d'études\n" +
+    "Une fois arrivé(e) en France, vous avez l’obligation de suivre au moins une année de formation au sein de notre école. Tout désistement en cours d’année entraîne le paiement de la totalité des frais de scolarité.\n\n" +
+    "Nous restons à votre entière disposition. WhatsApp :\n" +
+    "• " + CONFIG.WHATSAPP_ADMISSIONS[0] + "\n" +
+    "• " + CONFIG.WHATSAPP_ADMISSIONS[1] + "\n\n" +
+    "Cordialement,\n\nL'équipe des Admissions";
+
+  const html =
+    '<div style="font-family:Arial,sans-serif;line-height:1.55;color:#1f2937;max-width:760px;margin:auto">' +
+    '<p>Bonjour <strong>' + echapperHtml_(nom) + '</strong>,</p>' +
+    '<p>Suite à votre candidature, nous avons le plaisir de vous annoncer votre admission au sein de notre établissement ! Vous trouverez en pièce jointe votre lettre d\'admission.</p>' +
+    '<div style="background:#f3f4f6;border-left:4px solid #1f4e78;padding:14px 18px;margin:18px 0">' +
+    '<strong>Récapitulatif de votre cursus</strong><ul>' +
+    '<li><strong>Formation :</strong> ' + echapperHtml_(formation) + '</li>' +
+    '<li><strong>Niveau :</strong> ' + echapperHtml_(niveau) + '</li>' +
+    '<li><strong>Domaine :</strong> ' + echapperHtml_(domaine) + '</li>' +
+    '<li><strong>Rythme :</strong> ' + echapperHtml_(rythme) + '</li>' +
+    '<li><strong>Campus d\'affectation :</strong> ' + echapperHtml_(campus) + '</li></ul></div>' +
+    '<h3>1. Certification RNCP</h3>' +
+    '<p>Votre formation est reconnue par l\'État. Voici le code RNCP correspondant : <strong>' + echapperHtml_(codeRncp) + '</strong>.</p>' +
+    '<p><em>NB : Les BTS / DCG / DSCG sont des diplômes d’État relevant du Ministère de l’Éducation nationale et préparés par l’ensemble des écoles agréées.</em></p>' +
+    '<p>Pour vérifier si ce code RNCP est bien actif et appartient à notre école, visionnez <a href="' + echapperHtml_(CONFIG.VIDEO_RNCP_URL) + '">la vidéo explicative</a>.</p>' +
+    '<h3>2. Modalités de paiement</h3><p>Pour procéder au paiement, vous disposez de 5 options :</p><ul>' +
+    '<li>Virement bancaire (RIB en pièce jointe ou au bas de votre lettre d’admission).</li>' +
+    '<li>Carte bancaire sur le site internet de l’école, rubrique « Inscriptions ».</li>' +
+    '<li>Sur place dans l’un de nos campus : Torcy, Évry, Lyon et Noisiel.</li>' +
+    '<li>Transfert de fonds : Orange Money, Western Union, MoneyGram, Ria, etc.</li>' +
+    '<li>PayPal via le site internet de l’école.</li></ul>' +
+    '<h3>3. Documents à retourner pour l’attestation d’inscription</h3>' +
+    '<p>Afin de finaliser votre inscription et de recevoir votre attestation, vous devez régler <strong>2 000 €</strong> : 1 000 € de frais d’inscription et 1 000 € d’acompte sur les frais de scolarité.</p><ul>' +
+    '<li>Preuve de paiement des frais d’inscription : 1 000 €.</li>' +
+    '<li>Preuve de paiement de l’acompte : minimum 1 000 €.</li>' +
+    '<li>Attestation sur l’honneur de souscription à l’offre d’A.V.I. de MBN Global Finance, signée.</li>' +
+    '<li>Votre lettre d’admission.</li>' +
+    '<li>Les conditions générales de vente signées avec la mention « Lu et approuvé ».</li></ul>' +
+    '<h3>4. Conditions de remboursement et refus de visa</h3><ul>' +
+    '<li>L’acompte des frais de scolarité est remboursable à 100 % en cas de refus de visa.</li>' +
+    '<li>Les frais d’inscription de 1 000 € ne sont pas remboursables.</li></ul>' +
+    '<p><strong>Note en cas de refus :</strong> après un premier refus, l’inscription reste valable pour une deuxième demande. Après un deuxième refus, de nouveaux frais d’inscription de 1 000 € seront nécessaires pour obtenir une nouvelle attestation.</p>' +
+    '<h3>5. A.V.I. — Caution bancaire étudiante</h3>' +
+    '<p>L’A.V.I. proposée avec MBN GLOBAL FINANCE n’est pas obligatoire, mais fortement recommandée. Les financements sont valables pour deux rentrées.</p>' +
+    '<h3>6. Engagement d’études</h3>' +
+    '<p>Une fois arrivé(e) en France, vous devez suivre au moins une année de formation. Tout désistement en cours d’année entraîne le paiement de la totalité des frais de scolarité.</p>' +
+    '<p>WhatsApp :<br>• ' + echapperHtml_(CONFIG.WHATSAPP_ADMISSIONS[0]) + '<br>• ' + echapperHtml_(CONFIG.WHATSAPP_ADMISSIONS[1]) + '</p>' +
+    '<p>Cordialement,<br><strong>L’équipe des Admissions</strong></p></div>';
+
+  const options = {
+    name: ressources.NOM_EXPEDITEUR || ("Admissions " + contexte.ecole),
+    htmlBody: html,
+    attachments: [pdfBlob.copyBlob()]
+  };
+  if (emailValide_(ressources.REPLY_TO || "")) options.replyTo = ressources.REPLY_TO;
+
+  executerAvecRelance_(function() {
+    MailApp.sendEmail(candidat.email, objet, texte, options);
+    return true;
+  }, 3, 1500, "Envoi de l'e-mail d'admission avec le PDF");
+}
+
+function envoyerDemandePiecesSelectionnee(codesPieces, commentaire) {
+  const contexte = obtenirContexteSelection_();
+  const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+
+  if (!emailValide_(candidat.email)) {
+    throw new Error("L'adresse e-mail du candidat est absente ou invalide.");
+  }
+
+  const codes = Array.isArray(codesPieces)
+    ? codesPieces.filter(function(code) {
+        return CONFIG.LIBELLES_PIECES[code];
+      })
+    : [];
+
+  if (codes.length === 0) {
+    throw new Error("Sélectionnez au moins une pièce manquante.");
+  }
+
+  const libelles = codes.map(function(code) {
+    return CONFIG.LIBELLES_PIECES[code];
+  });
+
+  const ressources = obtenirRessourcesEcole_(contexte.ecole);
+  const objet = remplacerVariablesTexte_(
+    CONFIG.OBJET_EMAIL_PIECES_MANQUANTES,
+    {
+      ECOLE: contexte.ecole,
+      FORMATION: candidat.formation,
+      REFERENCE_DOSSIER: candidat.reference_dossier
+    }
+  );
+
+  const listeTexte = libelles.map(function(libelle) {
+    return "- " + libelle;
+  }).join("\n");
+
+  const texte =
+    "Bonjour " + candidat.nom_complet + ",\n\n" +
+    "Après étude de votre candidature, votre dossier est incomplet.\n\n" +
+    "Merci de transmettre les éléments suivants :\n" +
+    listeTexte + "\n\n" +
+    (nettoyerValeur_(commentaire)
+      ? "Précision complémentaire :\n" + nettoyerValeur_(commentaire) + "\n\n"
+      : "") +
+    "Référence du dossier : " + candidat.reference_dossier + "\n\n" +
+    "Cordialement,\n" +
+    (ressources.NOM_EXPEDITEUR || ("Admissions " + contexte.ecole));
+
+  const listeHtml = libelles.map(function(libelle) {
+    return "<li>" + echapperHtml_(libelle) + "</li>";
+  }).join("");
+
+  const html =
+    "<p>Bonjour <strong>" + echapperHtml_(candidat.nom_complet) + "</strong>,</p>" +
+    "<p>Après étude de votre candidature, votre dossier est incomplet.</p>" +
+    "<p>Merci de transmettre les éléments suivants :</p>" +
+    "<ul>" + listeHtml + "</ul>" +
+    (nettoyerValeur_(commentaire)
+      ? "<p><strong>Précision complémentaire :</strong><br>" +
+        echapperHtml_(commentaire).replace(/\n/g, "<br>") +
+        "</p>"
+      : "") +
+    "<p><strong>Référence du dossier :</strong> " +
+    echapperHtml_(candidat.reference_dossier) + "</p>" +
+    "<p>Cordialement,<br>" +
+    echapperHtml_(ressources.NOM_EXPEDITEUR || ("Admissions " + contexte.ecole)) +
+    "</p>";
+
+  const options = {
+    name: ressources.NOM_EXPEDITEUR || ("Admissions " + contexte.ecole),
+    htmlBody: html
+  };
+
+  if (emailValide_(ressources.REPLY_TO || "")) {
+    options.replyTo = ressources.REPLY_TO;
+  }
+
+  MailApp.sendEmail(candidat.email, objet, texte, options);
+
+  const maintenant = formaterDate_(new Date());
+  const validateur = Session.getActiveUser().getEmail() || "Utilisateur Apps Script";
+
+  mettreAJourLigneParCles_(
+    contexte.feuille,
+    contexte.ligne,
+    {
+      statut: "DOSSIER INCOMPLET - EMAIL ENVOYÉ",
+      motif_non_conformite: nettoyerValeur_(commentaire),
+      pieces_manquantes: libelles.join(", "),
+      date_email: maintenant,
+      valide_par: validateur
+    }
+  );
+
+  return {
+    success: true,
+    email: candidat.email,
+    pieces: libelles
+  };
+}
+
+function reanalyserPiecesSelectionnees() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+    const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+    const liens = extraireLiensPiecesLigne_(candidat);
+    const manquantes = detecterPiecesManquantes_(
+      contexte.typeAdmission,
+      liens,
+      candidat.handicap
+    );
+    const libelles = manquantes.map(function(code) {
+      return CONFIG.LIBELLES_PIECES[code] || code;
+    });
+
+    mettreAJourLigneParCles_(
+      contexte.feuille,
+      contexte.ligne,
+      {
+        pieces_manquantes: libelles.join(", "),
+        statut: libelles.length > 0
+          ? "DOSSIER INCOMPLET - À CONTRÔLER"
+          : "DOSSIER COMPLET - À VALIDER"
+      }
+    );
+
+    ui.alert(
+      "Analyse terminée",
+      libelles.length > 0
+        ? "Pièces manquantes : " + libelles.join(", ")
+        : "Toutes les pièces obligatoires sont présentes.",
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Erreur", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+// ============================================================================
+// 14 BIS. ACTIONS EN LOT SUR LES LIGNES SÉLECTIONNÉES
+// ============================================================================
+
+/**
+ * Envoie une lettre d'admission à chaque candidat situé sur les lignes
+ * sélectionnées. Une sélection continue ou plusieurs plages avec Ctrl/Cmd
+ * sont acceptées. Les lignes vides et la ligne d'en-tête sont ignorées.
+ */
+function envoyerLettresAdmissionSelectionnees() {
+  const ui = SpreadsheetApp.getUi();
+  const feuille = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lignes = obtenirNumerosLignesSelectionnees_(feuille);
+
+  if (lignes.length === 0) {
+    ui.alert("Aucune ligne", "Sélectionnez au moins une ligne de candidat.", ui.ButtonSet.OK);
+    return;
+  }
+
+  const confirmation = ui.alert(
+    "Validation groupée des admissions",
+    "Traiter et envoyer une lettre d'admission pour " + lignes.length +
+      " ligne(s) sélectionnée(s) ?",
+    ui.ButtonSet.YES_NO
+  );
+
+  if (confirmation !== ui.Button.YES) return;
+
+  const succes = [];
+  const ignores = [];
+  const erreurs = [];
+  const selectionInitiale = feuille.getActiveRange();
+
+  lignes.forEach(function(ligne) {
+    try {
+      const candidat = lireCandidatLigne_(feuille, ligne);
+
+      if (!candidat.nom_complet && !candidat.email) {
+        ignores.push("Ligne " + ligne + " : ligne vide");
+        return;
+      }
+
+      feuille.setActiveRange(feuille.getRange(ligne, 1));
+      const resultat = validerEtEnvoyerAdmissionSelectionnee();
+      succes.push(
+        "Ligne " + ligne + " : " + resultat.email + " — " +
+        (resultat.mode_traitement === "SIGNATURE_INTERNE_OTP" ? "signature interne" : "envoi direct")
+      );
+    } catch (erreur) {
+      erreurs.push("Ligne " + ligne + " : " + erreur.message);
+    }
+  });
+
+  if (selectionInitiale) {
+    feuille.setActiveRange(selectionInitiale);
+  }
+
+  afficherBilanTraitementLot_(
+    "Validation groupée terminée",
+    succes,
+    ignores,
+    erreurs
+  );
+}
+
+/**
+ * Analyse automatiquement les pièces de chaque ligne sélectionnée et envoie
+ * l'e-mail de non-conformité uniquement lorsque des documents obligatoires
+ * sont absents.
+ */
+function notifierDossiersNonConformesSelectionnes() {
+  const ui = SpreadsheetApp.getUi();
+  const feuille = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lignes = obtenirNumerosLignesSelectionnees_(feuille);
+
+  if (lignes.length === 0) {
+    ui.alert("Aucune ligne", "Sélectionnez au moins une ligne de candidat.", ui.ButtonSet.OK);
+    return;
+  }
+
+  const saisie = ui.prompt(
+    "Notification de non-conformité",
+    "Ajoutez éventuellement une précision commune aux candidats sélectionnés, puis cliquez sur OK.",
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (saisie.getSelectedButton() !== ui.Button.OK) return;
+
+  const commentaire = nettoyerValeur_(saisie.getResponseText());
+  const succes = [];
+  const ignores = [];
+  const erreurs = [];
+  const selectionInitiale = feuille.getActiveRange();
+
+  lignes.forEach(function(ligne) {
+    try {
+      feuille.setActiveRange(feuille.getRange(ligne, 1));
+      const contexte = obtenirContexteSelection_();
+      const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+
+      if (!candidat.nom_complet && !candidat.email) {
+        ignores.push("Ligne " + ligne + " : ligne vide");
+        return;
+      }
+
+      const liens = extraireLiensPiecesLigne_(candidat);
+      const manquantes = detecterPiecesManquantes_(
+        contexte.typeAdmission,
+        liens,
+        candidat.handicap
+      );
+
+      if (manquantes.length === 0) {
+        ignores.push("Ligne " + ligne + " : dossier complet");
+        return;
+      }
+
+      const resultat = envoyerDemandePiecesSelectionnee(manquantes, commentaire);
+      succes.push(
+        "Ligne " + ligne + " : " + resultat.email + " — " +
+        (resultat.mode_traitement === "SIGNATURE_INTERNE_OTP" ? "signature interne" : "envoi direct")
+      );
+    } catch (erreur) {
+      erreurs.push("Ligne " + ligne + " : " + erreur.message);
+    }
+  });
+
+  if (selectionInitiale) {
+    feuille.setActiveRange(selectionInitiale);
+  }
+
+  afficherBilanTraitementLot_(
+    "Notifications terminées",
+    succes,
+    ignores,
+    erreurs
+  );
+}
+
+/**
+ * Met à jour le statut et la liste des pièces manquantes pour toutes les
+ * lignes sélectionnées, sans envoyer d'e-mail.
+ */
+function reanalyserPiecesSelectionneesEnLot() {
+  const feuille = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lignes = obtenirNumerosLignesSelectionnees_(feuille);
+  const succes = [];
+  const ignores = [];
+  const erreurs = [];
+  const selectionInitiale = feuille.getActiveRange();
+
+  lignes.forEach(function(ligne) {
+    try {
+      feuille.setActiveRange(feuille.getRange(ligne, 1));
+      const contexte = obtenirContexteSelection_();
+      const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+
+      if (!candidat.nom_complet && !candidat.email) {
+        ignores.push("Ligne " + ligne + " : ligne vide");
+        return;
+      }
+
+      const liens = extraireLiensPiecesLigne_(candidat);
+      const manquantes = detecterPiecesManquantes_(
+        contexte.typeAdmission,
+        liens,
+        candidat.handicap
+      );
+      const libelles = manquantes.map(function(code) {
+        return CONFIG.LIBELLES_PIECES[code] || code;
+      });
+
+      mettreAJourLigneParCles_(
+        contexte.feuille,
+        contexte.ligne,
+        {
+          pieces_manquantes: libelles.join(", "),
+          statut: libelles.length > 0
+            ? "DOSSIER INCOMPLET - À CONTRÔLER"
+            : "DOSSIER COMPLET - À VALIDER"
+        }
+      );
+
+      succes.push(
+        "Ligne " + ligne + " : " +
+        (libelles.length > 0 ? libelles.length + " pièce(s) manquante(s)" : "dossier complet")
+      );
+    } catch (erreur) {
+      erreurs.push("Ligne " + ligne + " : " + erreur.message);
+    }
+  });
+
+  if (selectionInitiale) {
+    feuille.setActiveRange(selectionInitiale);
+  }
+
+  afficherBilanTraitementLot_(
+    "Audit des pièces terminé",
+    succes,
+    ignores,
+    erreurs
+  );
+}
+
+/**
+ * Retourne les numéros de lignes correspondant à la sélection active.
+ * La sélection d'une colonne entière est limitée aux lignes réellement
+ * utilisées dans la feuille.
+ */
+function obtenirNumerosLignesSelectionnees_(feuille) {
+  const rangeList = feuille.getActiveRangeList();
+  const plages = rangeList
+    ? rangeList.getRanges()
+    : (feuille.getActiveRange() ? [feuille.getActiveRange()] : []);
+  const derniereLigne = Math.max(feuille.getLastRow(), 1);
+  const ensemble = {};
+
+  plages.forEach(function(plage) {
+    const debut = Math.max(2, plage.getRow());
+    const fin = Math.min(
+      derniereLigne,
+      plage.getRow() + plage.getNumRows() - 1
+    );
+
+    for (let ligne = debut; ligne <= fin; ligne++) {
+      ensemble[ligne] = true;
+    }
+  });
+
+  return Object.keys(ensemble)
+    .map(function(ligne) { return Number(ligne); })
+    .sort(function(a, b) { return a - b; });
+}
+
+function afficherBilanTraitementLot_(titre, succes, ignores, erreurs) {
+  const ui = SpreadsheetApp.getUi();
+  const lignes = [
+    "Version : " + CONFIG.VERSION,
+    "",
+    "Succès : " + succes.length,
+    "Ignorés : " + ignores.length,
+    "Erreurs : " + erreurs.length
+  ];
+
+  if (erreurs.length > 0) {
+    lignes.push("", "Détails des erreurs :", erreurs.slice(0, 15).join("\n"));
+
+    if (erreurs.length > 15) {
+      lignes.push("... et " + (erreurs.length - 15) + " autre(s) erreur(s).");
+    }
+  }
+
+  ui.alert(titre, lignes.join("\n"), ui.ButtonSet.OK);
+}
+
+
+// ============================================================================
+// 14 TER. SIGNATURE INTERNE OTP + CANVAS — ADMISSIONS NATIONALES
+// ============================================================================
+
+function obtenirClesColonnesSignatureInterne_() {
+  return [
+    "statut_signature",
+    "id_demande_signature",
+    "id_document_signature",
+    "id_signataire",
+    "id_fichier_pdf_original",
+    "date_envoi_signature",
+    "date_signature",
+    "date_consultation_signature",
+    "expiration_signature",
+    "lien_signature",
+    "token_signature_hash",
+    "otp_signature_hash",
+    "otp_expiration",
+    "otp_tentatives",
+    "date_derniere_otp",
+    "lien_pdf_signe",
+    "lien_dossier_preuve",
+    "niveau_signature",
+    "consentement_signature",
+    "user_agent_signature",
+    "empreinte_pdf_original",
+    "empreinte_pdf_signe",
+    "id_fichier_signature_image",
+    "id_evenement_signature",
+    "derniere_relance_signature",
+    "erreur_signature"
+  ];
+}
+
+function obtenirTitresColonnesSignatureInterne_() {
+  const cles = obtenirClesColonnesSignatureInterne_();
+  return cles.map(function(cle) {
+    const champ = CHAMPS.filter(function(item) {
+      return item.cle === cle;
+    })[0];
+    return champ ? champ.titre : cle;
+  });
+}
+
+function installerColonnesSignatureInterneDansFeuille_(feuille) {
+  if (!feuille || feuille.getLastColumn() < 1) {
+    throw new Error("La feuille ne contient pas de ligne d'en-tête.");
+  }
+
+  const correspondance = synchroniserColonnes_(feuille);
+  const cles = obtenirClesColonnesSignatureInterne_();
+  const manquantes = cles.filter(function(cle) {
+    return !correspondance[cle];
+  });
+
+  if (manquantes.length === 0) {
+    return { ajoutees: 0, titres: [] };
+  }
+
+  const titres = manquantes.map(function(cle) {
+    const champ = CHAMPS.filter(function(item) {
+      return item.cle === cle;
+    })[0];
+    return champ ? champ.titre : cle;
+  });
+
+  feuille.getRange(
+    1,
+    feuille.getLastColumn() + 1,
+    1,
+    titres.length
+  ).setValues([titres]);
+
+  return {
+    ajoutees: titres.length,
+    titres: titres
+  };
+}
+
+function installerColonnesSignatureInterneOngletActif() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const feuille = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    const resultat = installerColonnesSignatureInterneDansFeuille_(feuille);
+
+    ui.alert(
+      "Colonnes de signature",
+      resultat.ajoutees === 0
+        ? "Toutes les colonnes nécessaires existent déjà."
+        : resultat.ajoutees + " colonne(s) ajoutée(s) :\n" +
+          resultat.titres.join("\n"),
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Erreur", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+function obtenirIdsSheetsNationauxConfigures_() {
+  const ids = [];
+
+  Object.keys(ROUTEUR_SHEETS).forEach(function(campus) {
+    const id = nettoyerValeur_(ROUTEUR_SHEETS[campus].NATIONAL);
+
+    if (
+      id &&
+      id.indexOf("A_REMPLACER") === -1 &&
+      ids.indexOf(id) === -1
+    ) {
+      ids.push(id);
+    }
+  });
+
+  return ids;
+}
+
+function installerColonnesSignatureInterneTousSheetsNationaux() {
+  const ui = SpreadsheetApp.getUi();
+  const bilan = [];
+  let total = 0;
+
+  try {
+    obtenirIdsSheetsNationauxConfigures_().forEach(function(idClasseur) {
+      const classeur = SpreadsheetApp.openById(idClasseur);
+
+      classeur.getSheets().forEach(function(feuille) {
+        try {
+          determinerEcole_(feuille.getName());
+          const resultat = installerColonnesSignatureInterneDansFeuille_(feuille);
+          total += resultat.ajoutees;
+          bilan.push(
+            classeur.getName() + " / " + feuille.getName() +
+            " : " + resultat.ajoutees + " ajout(s)"
+          );
+        } catch (_) {
+          // Les onglets techniques ou non reconnus sont ignorés.
+        }
+      });
+    });
+
+    ui.alert(
+      "Installation terminée",
+      "Colonnes ajoutées : " + total + "\n\n" +
+      bilan.slice(0, 30).join("\n"),
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Erreur", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+function secretSignatureEstInvalide_(secret) {
+  const valeur = nettoyerValeur_(secret);
+
+  return (
+    !valeur ||
+    valeur.length < 32 ||
+    /^https?:\/\//i.test(valeur) ||
+    /script\.google\.com\/macros\/s\//i.test(valeur)
+  );
+}
+
+function genererNouveauSecretSignature_() {
+  return [
+    Utilities.getUuid(),
+    Utilities.getUuid(),
+    Utilities.getUuid(),
+    new Date().getTime()
+  ].join("|");
+}
+
+function obtenirOuCreerSecretSignature_() {
+  const proprietes = PropertiesService.getScriptProperties();
+  let secret = nettoyerValeur_(
+    proprietes.getProperty("SIGNATURE_SECRET")
+  );
+
+  // Correction automatique :
+  // SIGNATURE_SECRET ne doit jamais contenir l'URL du portail.
+  if (secretSignatureEstInvalide_(secret)) {
+    secret = genererNouveauSecretSignature_();
+
+    proprietes.setProperty(
+      "SIGNATURE_SECRET",
+      secret
+    );
+  }
+
+  return secret;
+}
+
+function normaliserUrlWebAppSignature_(url) {
+  const valeur = String(url || "")
+    .trim()
+    .split("#")[0]
+    .split("?")[0]
+    .replace(/\/+$/g, "");
+
+  if (!valeur) {
+    return "";
+  }
+
+  const modele =
+    /^https:\/\/script\.google\.com\/macros\/s\/[^/?#]+\/exec$/i;
+
+  return modele.test(valeur) ? valeur : "";
+}
+
+function obtenirUrlWebAppSignature_() {
+  const proprietes =
+    PropertiesService.getScriptProperties();
+
+  const urlProprieteBrute = nettoyerValeur_(
+    proprietes.getProperty("SIGNATURE_WEBAPP_URL")
+  );
+
+  const urlPropriete =
+    normaliserUrlWebAppSignature_(urlProprieteBrute);
+
+  // IMPORTANT :
+  // L'URL saisie explicitement par l'administrateur est prioritaire.
+  // ScriptApp.getService().getUrl() peut encore désigner un ancien
+  // déploiement lorsqu'il existe plusieurs déploiements.
+  if (urlPropriete) {
+    return urlPropriete;
+  }
+
+  const urlServiceBrute = nettoyerValeur_(
+    ScriptApp.getService().getUrl()
+  );
+
+  const urlService =
+    normaliserUrlWebAppSignature_(urlServiceBrute);
+
+  if (urlService) {
+    return urlService;
+  }
+
+  throw new Error(
+    "Aucune URL /exec valide n'est configurée.\n\n" +
+    "Dans Google Sheets, utilisez :\n" +
+    "ADMISSIONS HYBRIDES V11 > Configurer l’URL du portail.\n\n" +
+    "Collez l'URL exacte du nouveau déploiement terminée par /exec."
+  );
+}
+
+function construireLienSignatureInterne_(token) {
+  const jeton = nettoyerValeur_(token);
+
+  if (!jeton) {
+    throw new Error("Le jeton de signature est absent.");
+  }
+
+  return (
+    obtenirUrlWebAppSignature_() +
+    "?action=signer&token=" +
+    encodeURIComponent(jeton)
+  );
+}
+
+function verifierAccesPublicPortailSignature_() {
+  // Cette fonction reste compatible avec l'ancien backend, mais elle
+  // ne bloque plus la création des signatures sur la base d'un
+  // auto-test UrlFetchApp. L'URL est seulement validée.
+  return {
+    success: true,
+    url: obtenirUrlWebAppSignature_(),
+    verification: "FORMAT_URL_VALIDE"
+  };
+}
+
+function configurerUrlPortailSignature() {
+  const ui = SpreadsheetApp.getUi();
+  const proprietes =
+    PropertiesService.getScriptProperties();
+
+  const actuelle = nettoyerValeur_(
+    proprietes.getProperty("SIGNATURE_WEBAPP_URL")
+  );
+
+  const reponse = ui.prompt(
+    "Configurer le portail de signature",
+    "Collez l'URL exacte du NOUVEAU déploiement Apps Script.\n\n" +
+    "Elle doit commencer par :\n" +
+    "https://script.google.com/macros/s/\n\n" +
+    "et se terminer par :\n" +
+    "/exec\n\n" +
+    "URL actuelle :\n" +
+    (actuelle || "Aucune"),
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (reponse.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+
+  const url = normaliserUrlWebAppSignature_(
+    reponse.getResponseText()
+  );
+
+  if (!url) {
+    ui.alert(
+      "URL refusée",
+      "L'adresse n'est pas une URL de déploiement /exec valide.\n\n" +
+      "Exemple attendu :\n" +
+      "https://script.google.com/macros/s/AKfycb.../exec",
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  proprietes.setProperty(
+    "SIGNATURE_WEBAPP_URL",
+    url
+  );
+
+  const secretActuel = nettoyerValeur_(
+    proprietes.getProperty("SIGNATURE_SECRET")
+  );
+
+  if (secretSignatureEstInvalide_(secretActuel)) {
+    proprietes.setProperty(
+      "SIGNATURE_SECRET",
+      genererNouveauSecretSignature_()
+    );
+  }
+
+  CacheService
+    .getScriptCache()
+    .remove("PORTAIL_SIGNATURE_PUBLIC_OK_V11_2");
+
+  ui.alert(
+    "Portail configuré",
+    "L'URL suivante sera désormais utilisée en priorité :\n\n" +
+    url +
+    "\n\nLe champ SIGNATURE_SECRET a également été contrôlé.\n" +
+    "Vous pouvez maintenant lancer « Tester le portail configuré ».",
+    ui.ButtonSet.OK
+  );
+}
+
+function reinitialiserSecretSignature() {
+  const ui = SpreadsheetApp.getUi();
+
+  const confirmation = ui.alert(
+    "Réinitialiser le secret",
+    "Cette opération invalidera tous les anciens liens de signature.\n\n" +
+    "Continuer ?",
+    ui.ButtonSet.YES_NO
+  );
+
+  if (confirmation !== ui.Button.YES) {
+    return;
+  }
+
+  PropertiesService
+    .getScriptProperties()
+    .setProperty(
+      "SIGNATURE_SECRET",
+      genererNouveauSecretSignature_()
+    );
+
+  ui.alert(
+    "Secret réinitialisé",
+    "Le secret de signature a été remplacé.\n\n" +
+    "Vous devez régénérer les liens des candidats encore en attente.",
+    ui.ButtonSet.OK
+  );
+}
+
+function testerPortailConfigure() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const url = obtenirUrlWebAppSignature_();
+    const urlTest =
+      url +
+      "?action=signer&token=TEST_DIAGNOSTIC";
+
+    const reponse = UrlFetchApp.fetch(
+      urlTest,
+      {
+        method: "get",
+        muteHttpExceptions: true,
+        followRedirects: true
+      }
+    );
+
+    const code = reponse.getResponseCode();
+    const contenu = reponse.getContentText() || "";
+    const titreTrouve =
+      contenu.indexOf(
+        "Signature de votre lettre d'admission"
+      ) !== -1 ||
+      contenu.indexOf("signatureCanvas") !== -1 ||
+      contenu.indexOf("Vérification par code e-mail") !== -1;
+
+    const message =
+      "URL utilisée :\n" + url +
+      "\n\nCode HTTP : " + code +
+      "\nPortail HTML reconnu : " +
+      (titreTrouve ? "OUI" : "NON") +
+      "\n\nTest direct à ouvrir dans le navigateur :\n" +
+      url;
+
+    if (code === 200) {
+      ui.alert(
+        "Test du portail",
+        message +
+        "\n\nLe déploiement répond. Un jeton de test restera invalide, ce qui est normal.",
+        ui.ButtonSet.OK
+      );
+    } else {
+      ui.alert(
+        "Test du portail en échec",
+        message +
+        "\n\nLe code utilise maintenant exactement SIGNATURE_WEBAPP_URL. " +
+        "Copiez à nouveau l'URL depuis le NOUVEAU déploiement.",
+        ui.ButtonSet.OK
+      );
+    }
+  } catch (erreur) {
+    ui.alert(
+      "Test impossible",
+      erreur.message,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function creerDemandeSignatureInterne_(contexte, candidat, reference, lettre) {
+  if (!CONFIG.SIGNATURE_INTERNE || CONFIG.SIGNATURE_INTERNE.ACTIVE !== true) {
+    throw new Error("Le module de signature interne est désactivé.");
+  }
+
+  if (normaliserTexte_(contexte.typeAdmission) !== "NATIONAL") {
+    throw new Error("La signature interne est réservée au flux NATIONAL.");
+  }
+
+  if (!emailValide_(candidat.email)) {
+    throw new Error("L'adresse e-mail du candidat est invalide.");
+  }
+
+  const expiration = new Date();
+  expiration.setDate(
+    expiration.getDate() + CONFIG.SIGNATURE_INTERNE.VALIDITE_LIEN_JOURS
+  );
+
+  const token = creerJetonSignatureInterne_({
+    spreadsheetId: contexte.classeur.getId(),
+    sheetId: contexte.feuille.getSheetId(),
+    ligne: contexte.ligne,
+    reference: reference,
+    expirationMs: expiration.getTime()
+  });
+
+  // Le lien utilise exclusivement l'URL /exec configurée.
+  const lien = construireLienSignatureInterne_(token);
+
+  return {
+    idDemande: "SIG-" + Utilities.getUuid(),
+    idSignataire: "USR-" + Utilities.getUuid(),
+    tokenHash: hacherTexteSha256_(token),
+    lienSignature: lien,
+    expirationIso: expiration.toISOString(),
+    empreintePdfOriginal: hacherBlobSha256_(lettre.pdfBlob)
+  };
+}
+
+function creerJetonSignatureInterne_(parametres) {
+  const payload = {
+    v: 1,
+    sid: parametres.spreadsheetId,
+    gid: Number(parametres.sheetId),
+    row: Number(parametres.ligne),
+    ref: String(parametres.reference || ""),
+    exp: Number(parametres.expirationMs),
+    nonce: Utilities.getUuid()
+  };
+
+  const partieDonnees = encoderBase64UrlTexte_(
+    JSON.stringify(payload)
+  );
+  const partieSignature = signerHmacBase64Url_(
+    partieDonnees,
+    obtenirOuCreerSecretSignature_()
+  );
+
+  return partieDonnees + "." + partieSignature;
+}
+
+function verifierJetonSignatureInterne_(token) {
+  const valeur = nettoyerValeur_(token);
+  const parties = valeur.split(".");
+
+  if (parties.length !== 2) {
+    throw new Error("Lien de signature invalide.");
+  }
+
+  const signatureAttendue = signerHmacBase64Url_(
+    parties[0],
+    obtenirOuCreerSecretSignature_()
+  );
+
+  if (!comparaisonConstante_(parties[1], signatureAttendue)) {
+    throw new Error("Lien de signature falsifié ou invalide.");
+  }
+
+  let payload;
+
+  try {
+    payload = JSON.parse(decoderBase64UrlTexte_(parties[0]));
+  } catch (_) {
+    throw new Error("Le lien de signature est illisible.");
+  }
+
+  if (
+    !payload ||
+    payload.v !== 1 ||
+    !payload.sid ||
+    !payload.gid ||
+    !payload.ref ||
+    !payload.exp
+  ) {
+    throw new Error("Le lien de signature est incomplet.");
+  }
+
+  if (Date.now() > Number(payload.exp)) {
+    throw new Error("Ce lien de signature a expiré.");
+  }
+
+  return payload;
+}
+
+function obtenirContexteDepuisJetonSignature_(token) {
+  const payload = verifierJetonSignatureInterne_(token);
+  const classeur = SpreadsheetApp.openById(payload.sid);
+  const feuille = obtenirFeuilleParId_(classeur, Number(payload.gid));
+
+  if (!feuille) {
+    throw new Error("L'onglet associé à cette signature n'existe plus.");
+  }
+
+  let ligne = Number(payload.row);
+  let candidat = null;
+
+  if (ligne >= 2 && ligne <= feuille.getLastRow()) {
+    candidat = lireCandidatLigne_(feuille, ligne);
+  }
+
+  if (
+    !candidat ||
+    nettoyerValeur_(candidat.reference_dossier) !== nettoyerValeur_(payload.ref)
+  ) {
+    ligne = trouverLigneParReference_(feuille, payload.ref);
+
+    if (!ligne) {
+      throw new Error("Le dossier associé au lien est introuvable.");
+    }
+
+    candidat = lireCandidatLigne_(feuille, ligne);
+  }
+
+  if (
+    !comparaisonConstante_(
+      nettoyerValeur_(candidat.token_signature_hash),
+      hacherTexteSha256_(token)
+    )
+  ) {
+    throw new Error("Ce lien a été révoqué ou remplacé.");
+  }
+
+  const route = identifierClasseurRoute_(classeur.getId());
+  const campus = normaliserCampus_(candidat.campus) ||
+    (route ? route.campus : "");
+  const typeAdmission = normaliserTexte_(candidat.type_admission) ||
+    (route ? route.typeAdmission : "");
+
+  if (typeAdmission !== "NATIONAL") {
+    throw new Error("Ce dossier n'utilise pas le parcours de signature nationale.");
+  }
+
+  return {
+    payload: payload,
+    classeur: classeur,
+    feuille: feuille,
+    ligne: ligne,
+    candidat: candidat,
+    ecole: determinerEcole_(feuille.getName()),
+    campus: campus,
+    typeAdmission: typeAdmission
+  };
+}
+
+function obtenirFeuilleParId_(classeur, sheetId) {
+  const feuilles = classeur.getSheets();
+
+  for (let i = 0; i < feuilles.length; i++) {
+    if (Number(feuilles[i].getSheetId()) === Number(sheetId)) {
+      return feuilles[i];
+    }
+  }
+
+  return null;
+}
+
+function trouverLigneParReference_(feuille, reference) {
+  const colonnes = synchroniserColonnes_(feuille);
+
+  if (!colonnes.reference_dossier || feuille.getLastRow() < 2) {
+    return 0;
+  }
+
+  const plage = feuille.getRange(
+    2,
+    colonnes.reference_dossier,
+    feuille.getLastRow() - 1,
+    1
+  );
+  const cellule = plage.createTextFinder(String(reference))
+    .matchEntireCell(true)
+    .findNext();
+
+  return cellule ? cellule.getRow() : 0;
+}
+
+function chargerDossierSignature(token) {
+  try {
+    const contexte = obtenirContexteDepuisJetonSignature_(token);
+    contexteFinalisation = contexte;
+    const candidat = contexte.candidat;
+    const statut = normaliserStatutSignature_(candidat.statut_signature);
+
+    if (!candidat.date_consultation_signature) {
+      mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+        date_consultation_signature: formaterDate_(new Date()),
+        statut_signature: statut === "EN ATTENTE DE SIGNATURE"
+          ? "CONSULTÉ"
+          : candidat.statut_signature
+      });
+    }
+
+    return {
+      success: true,
+      dossier: {
+        reference: candidat.reference_dossier,
+        nomComplet: candidat.nom_complet ||
+          [candidat.nom, candidat.prenom].filter(Boolean).join(" "),
+        ecole: contexte.ecole,
+        campus: contexte.campus,
+        formation: candidat.formation,
+        emailMasque: masquerEmail_(candidat.email),
+        statut: statut,
+        dateExpiration: formaterDateHeureLisible_(new Date(Number(contexte.payload.exp))),
+        dejaSigne: statut === "SIGNÉ",
+        consentement: CONFIG.SIGNATURE_INTERNE.CONSENTEMENT_TEXTE
+      }
+    };
+  } catch (erreur) {
+    return {
+      success: false,
+      message: erreur.message
+    };
+  }
+}
+
+function envoyerOtpSignature(token) {
+  const contexte = obtenirContexteDepuisJetonSignature_(token);
+  const candidat = contexte.candidat;
+  const statut = normaliserStatutSignature_(candidat.statut_signature);
+
+  if (statut === "SIGNÉ") {
+    throw new Error("Ce document a déjà été signé.");
+  }
+
+  if (statut === "RÉVOQUÉ") {
+    throw new Error("Cette demande a été révoquée.");
+  }
+
+  const dernierEnvoi = lireDateIso_(candidat.date_derniere_otp);
+
+  if (dernierEnvoi) {
+    const secondesEcoulees = Math.floor(
+      (Date.now() - dernierEnvoi.getTime()) / 1000
+    );
+
+    if (secondesEcoulees < CONFIG.SIGNATURE_INTERNE.DELAI_RENVOI_OTP_SECONDES) {
+      throw new Error(
+        "Veuillez patienter " +
+        (CONFIG.SIGNATURE_INTERNE.DELAI_RENVOI_OTP_SECONDES - secondesEcoulees) +
+        " seconde(s) avant de demander un nouveau code."
+      );
+    }
+  }
+
+  const code = genererCodeOtp6Chiffres_();
+  const expiration = new Date(
+    Date.now() + CONFIG.SIGNATURE_INTERNE.VALIDITE_OTP_MINUTES * 60 * 1000
+  );
+  const tokenHash = hacherTexteSha256_(token);
+  const otpHash = hacherTexteSha256_(
+    obtenirOuCreerSecretSignature_() + "|" + tokenHash + "|" + code
+  );
+
+  mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+    otp_signature_hash: otpHash,
+    otp_expiration: expiration.toISOString(),
+    otp_tentatives: 0,
+    date_derniere_otp: new Date().toISOString(),
+    erreur_signature: ""
+  });
+
+  try {
+    envoyerEmailOtpSignature_(
+      candidat,
+      {
+        ecole: contexte.ecole,
+        reference: candidat.reference_dossier
+      },
+      code
+    );
+  } catch (erreurEmail) {
+    mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+      otp_signature_hash: "",
+      otp_expiration: "",
+      erreur_signature: "OTP non envoyé : " + erreurEmail.message
+    });
+    throw erreurEmail;
+  }
+
+  return {
+    success: true,
+    emailMasque: masquerEmail_(candidat.email),
+    validiteMinutes: CONFIG.SIGNATURE_INTERNE.VALIDITE_OTP_MINUTES
+  };
+}
+
+function finaliserSignatureEtudiant(donnees) {
+  const verrou = LockService.getScriptLock();
+  verrou.waitLock(30000);
+  let finalisationCommencee = false;
+  let contexteFinalisation = null;
+
+  try {
+    const token = nettoyerValeur_(donnees && donnees.token);
+    const codeOtp = nettoyerValeur_(donnees && donnees.otp);
+    const signatureDataUrl = nettoyerValeur_(
+      donnees && donnees.signatureDataUrl
+    );
+    const consentementAccepte = Boolean(
+      donnees && donnees.consentementAccepte
+    );
+    const userAgent = tronquerTexteInterne_(
+      nettoyerValeur_(donnees && donnees.userAgent),
+      700
+    );
+
+    if (!token) {
+      throw new Error("Le jeton de signature est absent.");
+    }
+    if (!consentementAccepte) {
+      throw new Error("Le consentement doit être accepté.");
+    }
+    if (!signatureDataUrl) {
+      throw new Error("La signature manuscrite est absente.");
+    }
+
+    const contexte = obtenirContexteDepuisJetonSignature_(token);
+    const candidat = contexte.candidat;
+    const statut = normaliserStatutSignature_(candidat.statut_signature);
+
+    if (statut === "SIGNÉ") {
+      return {
+        success: true,
+        dejaSigne: true,
+        reference: candidat.reference_dossier,
+        message: "Cette lettre a déjà été signée."
+      };
+    }
+
+    verifierOtpSignatureInterne_(contexte, token, codeOtp);
+
+    const signatureBlob = decoderSignatureDataUrl_(signatureDataUrl);
+    const dossier = obtenirDossierParentDocument_(
+      candidat.id_document_signature
+    );
+    const idEvenement = nettoyerValeur_(candidat.id_evenement_signature) ||
+      "EVT-" + Utilities.getUuid();
+    const dateSignature = new Date();
+    const empreinteOriginale = nettoyerValeur_(
+      candidat.empreinte_pdf_original
+    ) || obtenirEmpreintePdfOriginale_(candidat);
+
+    mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+      statut_signature: "FINALISATION EN COURS",
+      id_evenement_signature: idEvenement,
+      erreur_signature: ""
+    });
+    finalisationCommencee = true;
+
+    const fichierSignature = dossier.createFile(
+      signatureBlob.setName(
+        "SIGNATURE_" +
+        nettoyerNomDrive_(candidat.reference_dossier) +
+        ".png"
+      )
+    );
+
+    insererSignatureDansDocument_(
+      candidat.id_document_signature,
+      signatureBlob,
+      {
+        candidat: candidat,
+        ecole: contexte.ecole,
+        campus: contexte.campus,
+        dateSignature: dateSignature,
+        idEvenement: idEvenement,
+        empreinteOriginale: empreinteOriginale,
+        userAgent: userAgent
+      }
+    );
+
+    const nomPdfSigne =
+      "LETTRE_ADMISSION_SIGNEE_" +
+      nettoyerNomDrive_(candidat.reference_dossier) +
+      ".pdf";
+
+    const pdfSigneBlob = exporterDocumentGoogleEnPdfV4_(
+      candidat.id_document_signature,
+      nomPdfSigne
+    );
+    const fichierPdfSigne = dossier.createFile(pdfSigneBlob);
+    const empreinteSignee = hacherBlobSha256_(pdfSigneBlob);
+
+    const preuve = creerDossierPreuveSignature_(
+      dossier,
+      {
+        candidat: candidat,
+        ecole: contexte.ecole,
+        campus: contexte.campus,
+        dateSignature: dateSignature,
+        idEvenement: idEvenement,
+        empreinteOriginale: empreinteOriginale,
+        empreinteSignee: empreinteSignee,
+        consentement: CONFIG.SIGNATURE_INTERNE.CONSENTEMENT_TEXTE,
+        userAgent: userAgent,
+        idFichierPdfSigne: fichierPdfSigne.getId(),
+        idFichierSignature: fichierSignature.getId()
+      }
+    );
+
+    const dateTexte = formaterDate_(dateSignature);
+
+    mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+      statut_signature: "SIGNÉ",
+      statut: "ADMIS - LETTRE SIGNÉE",
+      date_signature: dateTexte,
+      date_email: dateTexte,
+      lien_pdf_signe: fichierPdfSigne.getUrl(),
+      lien_dossier_preuve: preuve.pdfFile.getUrl(),
+      consentement_signature: CONFIG.SIGNATURE_INTERNE.CONSENTEMENT_TEXTE,
+      user_agent_signature: userAgent,
+      empreinte_pdf_original: empreinteOriginale,
+      empreinte_pdf_signe: empreinteSignee,
+      id_fichier_signature_image: fichierSignature.getId(),
+      otp_signature_hash: "",
+      otp_expiration: "",
+      erreur_signature: ""
+    });
+
+    let avertissementEmail = "";
+
+    try {
+      envoyerEmailFinalSignature_(
+        candidat,
+        {
+          ecole: contexte.ecole,
+          campus: contexte.campus,
+          reference: candidat.reference_dossier
+        },
+        pdfSigneBlob,
+        preuve.pdfBlob
+      );
+    } catch (erreurEmail) {
+      avertissementEmail =
+        " La signature est enregistrée, mais l'e-mail final n'a pas pu être envoyé.";
+      mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+        erreur_signature: "PDF signé créé, e-mail final non envoyé : " +
+          erreurEmail.message
+      });
+    }
+
+    return {
+      success: true,
+      reference: candidat.reference_dossier,
+      message:
+        "Votre signature a été enregistrée. Le PDF signé a été archivé." +
+        avertissementEmail
+    };
+  } catch (erreur) {
+    if (finalisationCommencee && contexteFinalisation) {
+      try {
+        mettreAJourLigneParCles_(
+          contexteFinalisation.feuille,
+          contexteFinalisation.ligne,
+          {
+            statut_signature: "ERREUR DE FINALISATION",
+            erreur_signature: erreur.message
+          }
+        );
+      } catch (_) {
+        // Ne pas masquer l'erreur principale.
+      }
+    }
+
+    throw erreur;
+  } finally {
+    verrou.releaseLock();
+  }
+}
+
+function verifierOtpSignatureInterne_(contexte, token, codeOtp) {
+  const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+  const tentatives = Number(candidat.otp_tentatives || 0);
+
+  if (!candidat.otp_signature_hash || !candidat.otp_expiration) {
+    throw new Error("Demandez d'abord un code de vérification.");
+  }
+
+  if (tentatives >= CONFIG.SIGNATURE_INTERNE.MAX_TENTATIVES_OTP) {
+    throw new Error(
+      "Nombre maximal de tentatives atteint. Demandez un nouveau code."
+    );
+  }
+
+  const expiration = lireDateIso_(candidat.otp_expiration);
+
+  if (!expiration || Date.now() > expiration.getTime()) {
+    throw new Error("Le code de vérification a expiré.");
+  }
+
+  if (!/^[0-9]{6}$/.test(codeOtp)) {
+    throw new Error("Le code doit contenir exactement 6 chiffres.");
+  }
+
+  const hashRecu = hacherTexteSha256_(
+    obtenirOuCreerSecretSignature_() +
+    "|" +
+    hacherTexteSha256_(token) +
+    "|" +
+    codeOtp
+  );
+
+  if (
+    !comparaisonConstante_(
+      nettoyerValeur_(candidat.otp_signature_hash),
+      hashRecu
+    )
+  ) {
+    mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+      otp_tentatives: tentatives + 1
+    });
+
+    throw new Error(
+      "Code incorrect. Tentative " +
+      (tentatives + 1) +
+      "/" +
+      CONFIG.SIGNATURE_INTERNE.MAX_TENTATIVES_OTP +
+      "."
+    );
+  }
+}
+
+function insererSignatureDansDocument_(documentId, signatureBlob, donnees) {
+  if (!documentId) {
+    throw new Error("L'identifiant du Google Docs original est absent.");
+  }
+
+  const document = DocumentApp.openById(documentId);
+  const body = document.getBody();
+  const texteComplet = body.getText();
+
+  if (
+    donnees.idEvenement &&
+    texteComplet.indexOf(donnees.idEvenement) !== -1
+  ) {
+    document.saveAndClose();
+    return;
+  }
+
+  const signatureInseree = insererImageSurBalise_(
+    body,
+    "{{SIGNATURE_CANDIDAT}}",
+    signatureBlob
+  );
+
+  remplacerBaliseSimpleDocument_(
+    body,
+    "{{DATE_SIGNATURE}}",
+    formaterDateHeureLisible_(donnees.dateSignature)
+  );
+  remplacerBaliseSimpleDocument_(
+    body,
+    "{{ID_SIGNATURE}}",
+    donnees.idEvenement
+  );
+
+  if (!signatureInseree) {
+    body.appendPageBreak();
+    body.appendParagraph("SIGNATURE DU CANDIDAT")
+      .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    body.appendImage(signatureBlob).setWidth(240).setHeight(95);
+    body.appendParagraph(
+      "Signé électroniquement le " +
+      formaterDateHeureLisible_(donnees.dateSignature)
+    );
+  }
+
+  body.appendPageBreak();
+  body.appendParagraph("CERTIFICAT DE SIGNATURE INTERNE")
+    .setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  body.appendParagraph(
+    "Ce certificat complète la lettre d'admission et retrace le parcours de validation."
+  );
+
+  const table = body.appendTable([
+    ["Référence du dossier", nettoyerValeur_(donnees.candidat.reference_dossier)],
+    ["Candidat", nettoyerValeur_(donnees.candidat.nom_complet)],
+    ["Adresse e-mail", nettoyerValeur_(donnees.candidat.email)],
+    ["École", nettoyerValeur_(donnees.ecole)],
+    ["Campus", nettoyerValeur_(donnees.campus)],
+    ["Date et heure", formaterDateHeureLisible_(donnees.dateSignature)],
+    ["Identifiant de l'événement", nettoyerValeur_(donnees.idEvenement)],
+    ["Empreinte SHA-256 du PDF original", nettoyerValeur_(donnees.empreinteOriginale)],
+    ["Navigateur déclaré", nettoyerValeur_(donnees.userAgent)]
+  ]);
+
+  table.getRow(0).getCell(0).setBackgroundColor("#e5e7eb");
+
+  body.appendParagraph("Signature manuscrite capturée :");
+  body.appendImage(signatureBlob).setWidth(240).setHeight(95);
+  body.appendParagraph("Consentement enregistré :");
+  body.appendParagraph(CONFIG.SIGNATURE_INTERNE.CONSENTEMENT_TEXTE);
+
+  document.saveAndClose();
+  Utilities.sleep(1800);
+}
+
+function insererImageSurBalise_(body, balise, blob) {
+  const resultat = body.findText(
+    echapperExpressionReguliere_(balise)
+  );
+
+  if (!resultat) {
+    return false;
+  }
+
+  const texte = resultat.getElement().asText();
+
+  if (resultat.isPartial()) {
+    texte.deleteText(
+      resultat.getStartOffset(),
+      resultat.getEndOffsetInclusive()
+    );
+  } else {
+    texte.setText("");
+  }
+
+  const parent = texte.getParent();
+
+  if (parent && typeof parent.appendInlineImage === "function") {
+    parent.appendInlineImage(blob).setWidth(240).setHeight(95);
+    return true;
+  }
+
+  return false;
+}
+
+function remplacerBaliseSimpleDocument_(body, balise, valeur) {
+  body.replaceText(
+    echapperExpressionReguliere_(balise),
+    nettoyerValeur_(valeur)
+  );
+}
+
+function creerDossierPreuveSignature_(dossier, donnees) {
+  const reference = nettoyerNomDrive_(
+    donnees.candidat.reference_dossier
+  );
+  const preuveObjet = {
+    version: "1.0",
+    type: "SIGNATURE_INTERNE_OTP_EMAIL_CANVAS",
+    id_evenement: donnees.idEvenement,
+    reference_dossier: donnees.candidat.reference_dossier,
+    candidat: {
+      nom_complet: donnees.candidat.nom_complet,
+      email: donnees.candidat.email
+    },
+    ecole: donnees.ecole,
+    campus: donnees.campus,
+    date_signature_iso: donnees.dateSignature.toISOString(),
+    date_signature_locale: formaterDateHeureLisible_(donnees.dateSignature),
+    consentement: donnees.consentement,
+    user_agent: donnees.userAgent,
+    empreinte_sha256_pdf_original: donnees.empreinteOriginale,
+    empreinte_sha256_pdf_signe: donnees.empreinteSignee,
+    id_fichier_pdf_signe: donnees.idFichierPdfSigne,
+    id_fichier_signature: donnees.idFichierSignature
+  };
+
+  const jsonBlob = Utilities.newBlob(
+    JSON.stringify(preuveObjet, null, 2),
+    "application/json",
+    "PREUVE_SIGNATURE_" + reference + ".json"
+  );
+  const jsonFile = dossier.createFile(jsonBlob);
+
+  const document = DocumentApp.create(
+    "PREUVE_SIGNATURE_" + reference
+  );
+  const fichierDocument = DriveApp.getFileById(document.getId());
+  fichierDocument.moveTo(dossier);
+
+  const body = document.getBody();
+  body.appendParagraph("DOSSIER DE PREUVE DE SIGNATURE")
+    .setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  body.appendParagraph(
+    "Signature interne avec vérification par code à usage unique envoyé par e-mail."
+  );
+  body.appendTable([
+    ["Identifiant de l'événement", donnees.idEvenement],
+    ["Référence du dossier", donnees.candidat.reference_dossier],
+    ["Candidat", donnees.candidat.nom_complet],
+    ["Adresse e-mail", donnees.candidat.email],
+    ["École", donnees.ecole],
+    ["Campus", donnees.campus],
+    ["Date et heure", formaterDateHeureLisible_(donnees.dateSignature)],
+    ["Mode de vérification", "Code OTP envoyé par e-mail"],
+    ["Empreinte SHA-256 du PDF original", donnees.empreinteOriginale],
+    ["Empreinte SHA-256 du PDF signé", donnees.empreinteSignee],
+    ["Navigateur déclaré", donnees.userAgent]
+  ]);
+  body.appendParagraph("Consentement :")
+    .setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  body.appendParagraph(donnees.consentement);
+  document.saveAndClose();
+
+  Utilities.sleep(1000);
+
+  const nomPdf = "PREUVE_SIGNATURE_" + reference + ".pdf";
+  const pdfBlob = exporterDocumentGoogleEnPdfV4_(
+    document.getId(),
+    nomPdf
+  );
+  const pdfFile = dossier.createFile(pdfBlob);
+
+  try {
+    fichierDocument.setTrashed(true);
+  } catch (_) {
+    // Le PDF et le JSON restent les pièces de preuve principales.
+  }
+
+  return {
+    jsonFile: jsonFile,
+    pdfFile: pdfFile,
+    pdfBlob: pdfBlob
+  };
+}
+
+function obtenirDossierParentDocument_(documentId) {
+  const fichier = DriveApp.getFileById(documentId);
+  const parents = fichier.getParents();
+
+  if (!parents.hasNext()) {
+    throw new Error("Le dossier du document d'admission est introuvable.");
+  }
+
+  return parents.next();
+}
+
+function obtenirEmpreintePdfOriginale_(candidat) {
+  const id = nettoyerValeur_(candidat.id_fichier_pdf_original) ||
+    extraireIdDriveDepuisUrlInterne_(candidat.lien_pdf_lettre);
+
+  if (!id) {
+    throw new Error("Le PDF original est introuvable.");
+  }
+
+  return hacherBlobSha256_(DriveApp.getFileById(id).getBlob());
+}
+
+function extraireIdDriveDepuisUrlInterne_(url) {
+  const correspondance = String(url || "").match(/[-\w]{25,}/);
+  return correspondance ? correspondance[0] : "";
+}
+
+function envoyerEmailDemandeSignatureInterne_(
+  candidat,
+  contexte,
+  lienSignature,
+  pdfBlob
+) {
+  const nom = nettoyerValeur_(candidat.nom_complet) ||
+    [candidat.nom, candidat.prenom].filter(Boolean).join(" ") ||
+    "Candidat(e)";
+  const sujet =
+    "Action requise : signez votre lettre d'admission — " +
+    contexte.ecole;
+  const texte =
+    "Bonjour " + nom + ",\n\n" +
+    "Votre lettre d'admission est prête.\n\n" +
+    "1. Consultez le PDF joint à cet e-mail.\n" +
+    "2. Ouvrez le lien privé suivant :\n" + lienSignature + "\n" +
+    "3. Demandez le code de vérification envoyé à votre adresse e-mail.\n" +
+    "4. Dessinez votre signature puis confirmez.\n\n" +
+    "Référence : " + contexte.reference + "\n" +
+    "Campus : " + contexte.campus + "\n\n" +
+    "Ce lien est personnel. Ne le transmettez pas.\n\n" +
+    "Cordialement,\nL'équipe des Admissions";
+
+  const html =
+    '<div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:680px;margin:auto">' +
+    '<h2 style="color:#1f4e78">Votre lettre d’admission est prête</h2>' +
+    '<p>Bonjour <strong>' + echapperHtml_(nom) + '</strong>,</p>' +
+    '<p>Consultez le PDF joint, puis utilisez le bouton ci-dessous pour signer.</p>' +
+    '<p style="margin:28px 0">' +
+    '<a href="' + echapperHtml_(lienSignature) + '" target="_blank" rel="noopener noreferrer" ' +
+    'style="background:#1f4e78;color:white;text-decoration:none;padding:14px 22px;border-radius:8px;display:inline-block">' +
+    'Signer ma lettre d’admission</a></p>' +
+    '<p style="font-size:13px;color:#475467">Si le bouton ne s’ouvre pas, copiez ce lien dans votre navigateur :</p>' +
+    '<p style="font-size:12px;word-break:break-all">' +
+    '<a href="' + echapperHtml_(lienSignature) + '" target="_blank" rel="noopener noreferrer">' +
+    echapperHtml_(lienSignature) +
+    '</a></p>' +
+    '<p><strong>Référence :</strong> ' + echapperHtml_(contexte.reference) + '<br>' +
+    '<strong>Campus :</strong> ' + echapperHtml_(contexte.campus) + '</p>' +
+    '<p style="font-size:13px;color:#6b7280">Ce lien est personnel. Un code à usage unique vous sera envoyé par e-mail au moment de la signature.</p>' +
+    '</div>';
+
+  const options = {
+    name: contexte.nomExpediteur || ("Admissions " + contexte.ecole),
+    htmlBody: html,
+    attachments: [pdfBlob]
+  };
+  if (emailValide_(contexte.replyTo || "")) {
+    options.replyTo = contexte.replyTo;
+  }
+  MailApp.sendEmail(candidat.email, sujet, texte, options);
+}
+
+function envoyerEmailOtpSignature_(candidat, contexte, code) {
+  const sujet =
+    "Votre code de signature — " + contexte.ecole;
+  const texte =
+    "Bonjour,\n\n" +
+    "Votre code de vérification est : " + code + "\n\n" +
+    "Ce code expire dans " +
+    CONFIG.SIGNATURE_INTERNE.VALIDITE_OTP_MINUTES +
+    " minutes.\n" +
+    "Référence : " + contexte.reference + "\n\n" +
+    "Ne communiquez ce code à personne.\n\n" +
+    "Cordialement,\nL'équipe des Admissions";
+
+  const html =
+    '<div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:560px;margin:auto">' +
+    '<h2>Code de vérification</h2>' +
+    '<p>Utilisez le code suivant pour confirmer votre signature :</p>' +
+    '<div style="font-size:34px;font-weight:700;letter-spacing:8px;background:#f3f4f6;padding:18px;text-align:center;border-radius:10px">' +
+    echapperHtml_(code) +
+    '</div>' +
+    '<p>Ce code expire dans <strong>' +
+    CONFIG.SIGNATURE_INTERNE.VALIDITE_OTP_MINUTES +
+    ' minutes</strong>.</p>' +
+    '<p style="font-size:13px;color:#6b7280">Ne communiquez ce code à personne.</p>' +
+    '</div>';
+
+  MailApp.sendEmail(candidat.email, sujet, texte, {
+    name: "Admissions " + contexte.ecole,
+    htmlBody: html
+  });
+}
+
+function envoyerEmailFinalSignature_(
+  candidat,
+  contexte,
+  pdfSigneBlob,
+  preuvePdfBlob
+) {
+  if (!emailValide_(candidat.email)) {
+    throw new Error(
+      "Impossible d'envoyer la copie signée : e-mail candidat invalide."
+    );
+  }
+
+  const nom = nettoyerValeur_(candidat.nom_complet) ||
+    [candidat.nom, candidat.prenom].filter(Boolean).join(" ") ||
+    "Candidat(e)";
+  const sujet = "Votre lettre d'admission signée est disponible";
+  const texte =
+    "Bonjour " + nom + ",\n\n" +
+    "Votre signature a bien été enregistrée.\n" +
+    "Vous trouverez en pièces jointes la lettre signée et le dossier de preuve.\n\n" +
+    "Référence : " + contexte.reference + "\n" +
+    "École : " + contexte.ecole + "\n" +
+    "Campus : " + contexte.campus + "\n\n" +
+    "Conservez ces documents.\n\n" +
+    "Cordialement,\nL'équipe des Admissions";
+
+  MailApp.sendEmail(candidat.email, sujet, texte, {
+    name: "Admissions " + contexte.ecole,
+    attachments: [pdfSigneBlob, preuvePdfBlob]
+  });
+}
+
+function regenererEtRenvoyerLienSignatureSelectionnee() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+
+    if (normaliserTexte_(contexte.typeAdmission) !== "NATIONAL") {
+      throw new Error(
+        "Cette action est réservée aux admissions nationales."
+      );
+    }
+
+    const candidat = lireCandidatLigne_(
+      contexte.feuille,
+      contexte.ligne
+    );
+    const statut = normaliserStatutSignature_(
+      candidat.statut_signature
+    );
+
+    if (statut === "SIGNÉ") {
+      throw new Error("Cette lettre est déjà signée.");
+    }
+
+    if (!candidat.reference_dossier) {
+      throw new Error("La référence du dossier est absente.");
+    }
+
+    if (!emailValide_(candidat.email)) {
+      throw new Error("L'adresse e-mail du candidat est invalide.");
+    }
+
+    // La génération n'est plus bloquée par un auto-test HTTP.
+    const expiration = new Date();
+    expiration.setDate(
+      expiration.getDate() +
+      CONFIG.SIGNATURE_INTERNE.VALIDITE_LIEN_JOURS
+    );
+
+    const token = creerJetonSignatureInterne_({
+      spreadsheetId: contexte.classeur.getId(),
+      sheetId: contexte.feuille.getSheetId(),
+      ligne: contexte.ligne,
+      reference: candidat.reference_dossier,
+      expirationMs: expiration.getTime()
+    });
+
+    const lien = construireLienSignatureInterne_(token);
+
+    const idPdf =
+      nettoyerValeur_(candidat.id_fichier_pdf_original) ||
+      extraireIdDriveDepuisUrlInterne_(
+        candidat.lien_pdf_lettre
+      );
+
+    if (!idPdf) {
+      throw new Error(
+        "Le PDF original de la lettre est introuvable."
+      );
+    }
+
+    const fichierPdf = DriveApp.getFileById(idPdf);
+    const ressourcesFlux = obtenirRessourcesFlux_(
+      contexte.ecole,
+      contexte.typeAdmission
+    );
+
+    // La nouvelle empreinte invalide immédiatement tous les anciens liens.
+    mettreAJourLigneParCles_(
+      contexte.feuille,
+      contexte.ligne,
+      {
+        statut_signature: "EN ATTENTE DE SIGNATURE",
+        statut: "ADMIS - EN ATTENTE DE SIGNATURE",
+        lien_signature: lien,
+        token_signature_hash: hacherTexteSha256_(token),
+        expiration_signature: expiration.toISOString(),
+        otp_signature_hash: "",
+        otp_expiration: "",
+        otp_tentatives: 0,
+        date_derniere_otp: "",
+        derniere_relance_signature: formaterDate_(new Date()),
+        erreur_signature: ""
+      }
+    );
+
+    envoyerEmailDemandeSignatureInterne_(
+      candidat,
+      {
+        ecole: contexte.ecole,
+        campus: contexte.campus,
+        reference: candidat.reference_dossier,
+        nomExpediteur: ressourcesFlux.NOM_EXPEDITEUR,
+        replyTo: ressourcesFlux.REPLY_TO
+      },
+      lien,
+      fichierPdf.getBlob()
+    );
+
+    ui.alert(
+      "Nouveau lien envoyé",
+      "Un nouveau lien Apps Script /exec a été créé.\n\n" +
+      "L'ancien lien a été invalidé.\n\n" +
+      "Adresse : " + candidat.email +
+      "\n\nLien :\n" + lien,
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Erreur", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+// Alias conservé pour les anciens menus.
+function relancerSignatureSelectionnee() {
+  regenererEtRenvoyerLienSignatureSelectionnee();
+}
+
+function revoquerSignatureSelectionnee() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+
+    if (normaliserTexte_(contexte.typeAdmission) !== "NATIONAL") {
+      throw new Error("Cette action est réservée aux admissions nationales.");
+    }
+
+    const candidat = lireCandidatLigne_(contexte.feuille, contexte.ligne);
+
+    if (normaliserStatutSignature_(candidat.statut_signature) === "SIGNÉ") {
+      throw new Error("Une signature finalisée ne peut pas être révoquée.");
+    }
+
+    const confirmation = ui.alert(
+      "Révoquer le lien",
+      "Le lien actuel deviendra immédiatement inutilisable. Continuer ?",
+      ui.ButtonSet.YES_NO
+    );
+
+    if (confirmation !== ui.Button.YES) {
+      return;
+    }
+
+    mettreAJourLigneParCles_(contexte.feuille, contexte.ligne, {
+      statut_signature: "RÉVOQUÉ",
+      statut: "ADMIS - SIGNATURE RÉVOQUÉE",
+      lien_signature: "",
+      token_signature_hash: "",
+      otp_signature_hash: "",
+      otp_expiration: "",
+      erreur_signature: ""
+    });
+
+    ui.alert(
+      "Lien révoqué",
+      "Le candidat ne peut plus utiliser l'ancien lien.",
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Erreur", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+
+function diagnostiquerPanneauEtSignature() {
+  const ui = SpreadsheetApp.getUi();
+  const lignes = [];
+
+  try {
+    const panneau = chargerPanneauAdmissions_();
+    lignes.push("Panneau HTML : OK (" + panneau.nom + ".html)");
+  } catch (erreurPanneau) {
+    lignes.push("Panneau HTML : ERREUR — " + erreurPanneau.message);
+  }
+
+  try {
+    HtmlService.createTemplateFromFile(
+      CONFIG.SIGNATURE_INTERNE.NOM_FICHIER_HTML
+    );
+    lignes.push(
+      "Portail HTML : OK (" +
+      CONFIG.SIGNATURE_INTERNE.NOM_FICHIER_HTML +
+      ".html)"
+    );
+  } catch (erreurPortail) {
+    lignes.push("Portail HTML : ERREUR — " + erreurPortail.message);
+  }
+
+  try {
+    const url = obtenirUrlWebAppSignature_();
+    lignes.push("URL /exec : OK — " + url);
+  } catch (erreurUrl) {
+    lignes.push("URL /exec : ERREUR — " + erreurUrl.message);
+  }
+
+  try {
+    const fichierActif = SpreadsheetApp.getActiveSpreadsheet();
+    lignes.push(
+      "Projet lié au Sheet : OK — " +
+      (fichierActif ? fichierActif.getName() : "non détecté")
+    );
+  } catch (erreurClasseur) {
+    lignes.push(
+      "Projet lié au Sheet : ERREUR — ouvrez Apps Script depuis Extensions > Apps Script dans le Google Sheet."
+    );
+  }
+
+  ui.alert(
+    "Diagnostic panneau et signature",
+    lignes.join("\n\n"),
+    ui.ButtonSet.OK
+  );
+}
+
+function diagnostiquerDeploiementSignature() {
+  const ui = SpreadsheetApp.getUi();
+  const proprietes =
+    PropertiesService.getScriptProperties();
+
+  try {
+    const urlPropriete = nettoyerValeur_(
+      proprietes.getProperty("SIGNATURE_WEBAPP_URL")
+    );
+
+    const urlService = nettoyerValeur_(
+      ScriptApp.getService().getUrl()
+    );
+
+    const secret = nettoyerValeur_(
+      proprietes.getProperty("SIGNATURE_SECRET")
+    );
+
+    const urlFinale =
+      obtenirUrlWebAppSignature_();
+
+    const secretCorrect =
+      !secretSignatureEstInvalide_(secret);
+
+    ui.alert(
+      "Diagnostic de configuration",
+      "URL enregistrée et prioritaire :\n" +
+      (urlPropriete || "VIDE") +
+      "\n\nURL détectée par ScriptApp :\n" +
+      (urlService || "VIDE") +
+      "\n\nURL réellement utilisée :\n" +
+      urlFinale +
+      "\n\nSIGNATURE_SECRET : " +
+      (secretCorrect
+        ? "CORRECT"
+        : "INCORRECT — il ne doit jamais contenir une URL") +
+      "\n\nPour vérifier le code HTTP, lancez « Tester le portail configuré ».",
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert(
+      "Diagnostic en échec",
+      erreur.message,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function testerPortailSignatureInterne() {
+  testerPortailConfigure();
+}
+
+function autoriserServicesSignatureInterne() {
+  DriveApp.getRootFolder().getName();
+  MailApp.getRemainingDailyQuota();
+
+  const documentTest = DocumentApp.create(
+    "TEST_AUTORISATION_SIGNATURE_INTERNE"
+  );
+
+  const secret = obtenirOuCreerSecretSignature_();
+  const url = nettoyerValeur_(
+    PropertiesService
+      .getScriptProperties()
+      .getProperty("SIGNATURE_WEBAPP_URL")
+  );
+
+  SpreadsheetApp.getUi().alert(
+    "Autorisations terminées",
+    "Drive, Docs, Sheets et MailApp sont autorisés.\n\n" +
+    "SIGNATURE_SECRET : " +
+    (secretSignatureEstInvalide_(secret)
+      ? "ERREUR"
+      : "CORRECT") +
+    "\nSIGNATURE_WEBAPP_URL : " +
+    (normaliserUrlWebAppSignature_(url)
+      ? "CONFIGURÉE"
+      : "À CONFIGURER") +
+    "\n\nDocument de test créé :\n" +
+    documentTest.getUrl() +
+    "\n\nVous pouvez supprimer ce document.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+function normaliserStatutSignature_(statut) {
+  const valeur = normaliserTexte_(statut);
+  const alias = {
+    "SIGNE": "SIGNÉ",
+    "SIGNED": "SIGNÉ",
+    "EN ATTENTE": "EN ATTENTE DE SIGNATURE",
+    "CONSULTE": "CONSULTÉ",
+    "REVOQUE": "RÉVOQUÉ"
+  };
+
+  return alias[valeur] || valeur;
+}
+
+function genererCodeOtp6Chiffres_() {
+  const source = Utilities.getUuid().replace(/-/g, "");
+  const nombre = parseInt(source.substring(0, 12), 16) % 1000000;
+  return String(nombre).padStart(6, "0");
+}
+
+function hacherTexteSha256_(texte) {
+  const octets = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(texte || ""),
+    Utilities.Charset.UTF_8
+  );
+  return octetsVersHex_(octets);
+}
+
+function hacherBlobSha256_(blob) {
+  if (!blob || typeof blob.getBytes !== "function") {
+    throw new Error("Impossible de calculer l'empreinte d'un fichier absent.");
+  }
+
+  const octets = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    blob.getBytes()
+  );
+  return octetsVersHex_(octets);
+}
+
+function octetsVersHex_(octets) {
+  return octets.map(function(octet) {
+    const valeur = (octet + 256) % 256;
+    return ("0" + valeur.toString(16)).slice(-2);
+  }).join("");
+}
+
+function signerHmacBase64Url_(message, secret) {
+  const octets = Utilities.computeHmacSha256Signature(
+    String(message || ""),
+    String(secret || ""),
+    Utilities.Charset.UTF_8
+  );
+
+  return Utilities.base64EncodeWebSafe(octets)
+    .replace(/=+$/g, "");
+}
+
+function encoderBase64UrlTexte_(texte) {
+  return Utilities.base64EncodeWebSafe(
+    String(texte || ""),
+    Utilities.Charset.UTF_8
+  ).replace(/=+$/g, "");
+}
+
+function decoderBase64UrlTexte_(texte) {
+  let valeur = String(texte || "");
+
+  while (valeur.length % 4 !== 0) {
+    valeur += "=";
+  }
+
+  const octets = Utilities.base64DecodeWebSafe(valeur);
+  return Utilities.newBlob(octets).getDataAsString("UTF-8");
+}
+
+function comparaisonConstante_(a, b) {
+  const gauche = String(a || "");
+  const droite = String(b || "");
+  let difference = gauche.length ^ droite.length;
+  const longueur = Math.max(gauche.length, droite.length);
+
+  for (let i = 0; i < longueur; i++) {
+    difference |=
+      (gauche.charCodeAt(i) || 0) ^
+      (droite.charCodeAt(i) || 0);
+  }
+
+  return difference === 0;
+}
+
+function decoderSignatureDataUrl_(dataUrl) {
+  const correspondance = String(dataUrl || "").match(
+    /^data:image\/png;base64,([A-Za-z0-9+/=\s]+)$/
+  );
+
+  if (!correspondance) {
+    throw new Error("Format de signature invalide. Une image PNG est requise.");
+  }
+
+  const octets = Utilities.base64Decode(
+    correspondance[1].replace(/\s/g, "")
+  );
+
+  if (
+    octets.length < 100 ||
+    octets.length > CONFIG.SIGNATURE_INTERNE.TAILLE_MAX_SIGNATURE_OCTETS
+  ) {
+    throw new Error(
+      "La taille de la signature est invalide ou dépasse la limite autorisée."
+    );
+  }
+
+  return Utilities.newBlob(
+    octets,
+    "image/png",
+    "signature.png"
+  );
+}
+
+function masquerEmail_(email) {
+  const valeur = String(email || "");
+  const parties = valeur.split("@");
+
+  if (parties.length !== 2) {
+    return valeur;
+  }
+
+  const local = parties[0];
+  const visible = local.substring(0, Math.min(2, local.length));
+
+  return visible +
+    "*".repeat(Math.max(2, local.length - visible.length)) +
+    "@" +
+    parties[1];
+}
+
+function lireDateIso_(valeur) {
+  const date = new Date(String(valeur || ""));
+  return isNaN(date.getTime()) ? null : date;
+}
+
+function formaterDateHeureLisible_(date) {
+  return Utilities.formatDate(
+    date,
+    CONFIG.FUSEAU_HORAIRE,
+    "dd/MM/yyyy 'à' HH:mm:ss"
+  );
+}
+
+function tronquerTexteInterne_(texte, longueurMax) {
+  const valeur = String(texte || "");
+  return valeur.length > longueurMax
+    ? valeur.substring(0, longueurMax)
+    : valeur;
+}
+
+
+// ============================================================================
+// 15. LECTURE ET MISE À JOUR DE LA LIGNE SÉLECTIONNÉE
+// ============================================================================
+
+function obtenirContexteSelection_() {
+  const classeur = SpreadsheetApp.getActiveSpreadsheet();
+  const feuille = classeur.getActiveSheet();
+  const plage = feuille.getActiveRange();
+
+  if (!plage) {
+    throw new Error("Sélectionnez une cellule sur la ligne du candidat.");
+  }
+
+  if (plage.getNumRows() !== 1 || plage.getRow() < 2) {
+    throw new Error("Sélectionnez une seule ligne de candidat, sous l'en-tête.");
+  }
+
+  const ecole = determinerEcole_(feuille.getName());
+  const contexteClasseur = identifierClasseurRoute_(classeur.getId());
+  const candidat = lireCandidatLigne_(feuille, plage.getRow());
+  const campus = normaliserCampus_(candidat.campus) ||
+    (contexteClasseur ? contexteClasseur.campus : "");
+  const typeAdmission = normaliserTexte_(candidat.type_admission) ||
+    (contexteClasseur ? contexteClasseur.typeAdmission : "");
+
+  if (!campus || !typeAdmission) {
+    throw new Error(
+      "Impossible d'identifier le campus ou le flux du classeur actif."
+    );
+  }
+
+  return {
+    classeur: classeur,
+    feuille: feuille,
+    ligne: plage.getRow(),
+    ecole: ecole,
+    campus: campus,
+    typeAdmission: typeAdmission
+  };
+}
+
+function identifierClasseurRoute_(spreadsheetId) {
+  const campusList = Object.keys(ROUTEUR_SHEETS);
+
+  for (let i = 0; i < campusList.length; i++) {
+    const campus = campusList[i];
+    const types = Object.keys(ROUTEUR_SHEETS[campus]);
+
+    for (let j = 0; j < types.length; j++) {
+      const typeAdmission = types[j];
+
+      if (ROUTEUR_SHEETS[campus][typeAdmission] === spreadsheetId) {
+        return {
+          campus: campus,
+          typeAdmission: typeAdmission
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function lireCandidatLigne_(feuille, numeroLigne) {
+  const correspondance = synchroniserColonnes_(feuille);
+  const ligne = feuille
+    .getRange(numeroLigne, 1, 1, feuille.getLastColumn())
+    .getDisplayValues()[0];
+
+  const candidat = {};
+
+  Object.keys(correspondance).forEach(function(cle) {
+    candidat[cle] = nettoyerValeur_(
+      ligne[correspondance[cle] - 1]
+    );
+  });
+
+  candidat.niveau_academique = candidat.niveau_academique || candidat.cycle || "";
+  candidat.domaine = candidat.domaine || "";
+  candidat.rythme_academique = candidat.rythme_academique || candidat.rythme || "";
+
+  return candidat;
+}
+
+function extraireLiensPiecesLigne_(candidat) {
+  return {
+    CV: candidat.lien_cv,
+    DIPLOME: candidat.lien_diplome,
+    PIECE_IDENTITE: candidat.lien_piece_identite,
+    CARTE_VITALE: candidat.lien_carte_vitale,
+    JUSTIFICATIF_HANDICAP: candidat.lien_justificatif_handicap
+  };
+}
+
+function mettreAJourLigneParCles_(feuille, numeroLigne, valeurs) {
+  const correspondance = synchroniserColonnes_(feuille);
+
+  Object.keys(valeurs).forEach(function(cle) {
+    const colonne = correspondance[cle];
+
+    if (colonne) {
+      feuille.getRange(numeroLigne, colonne).setValue(valeurs[cle]);
+    }
+  });
+
+  SpreadsheetApp.flush();
+}
+
+// ============================================================================
+// 16. CONFIGURATION ET UTILITAIRES DU WORKFLOW
+// ============================================================================
+
+function obtenirRessourcesEcole_(ecole) {
+  const ressources = CONFIG.RESSOURCES_ECOLES[ecole];
+
+  if (!ressources) {
+    throw new Error(
+      "Aucune ressource Drive/Docs n'est configurée pour l'école " +
+      ecole +
+      ". Ajoutez-la dans CONFIG.RESSOURCES_ECOLES."
+    );
+  }
+
+  return ressources;
+}
+
+function obtenirRessourcesFlux_(ecole, typeAdmission) {
+  const ressources = obtenirRessourcesEcole_(ecole);
+  const flux = normaliserTexte_(typeAdmission);
+
+  if (["NATIONAL", "INTERNATIONAL"].indexOf(flux) === -1) {
+    throw new Error("Flux d'admission non reconnu : " + typeAdmission + ".");
+  }
+
+  const templateId = flux === "NATIONAL"
+    ? ressources.TEMPLATE_NATIONAL_ID
+    : ressources.TEMPLATE_INTERNATIONAL_ID;
+
+  const dossierSpecifique = flux === "NATIONAL"
+    ? ressources.DOSSIER_DRIVE_NATIONAL_ID
+    : ressources.DOSSIER_DRIVE_INTERNATIONAL_ID;
+
+  const nomExpediteurSpecifique = flux === "NATIONAL"
+    ? ressources.NOM_EXPEDITEUR_NATIONAL
+    : ressources.NOM_EXPEDITEUR_INTERNATIONAL;
+
+  const replyToSpecifique = flux === "NATIONAL"
+    ? ressources.REPLY_TO_NATIONAL
+    : ressources.REPLY_TO_INTERNATIONAL;
+
+  return {
+    ECOLE: ecole,
+    TYPE_ADMISSION: flux,
+    TEMPLATE_ID: nettoyerValeur_(templateId),
+    DOSSIER_DRIVE_ID: estIdConfigure_(dossierSpecifique)
+      ? nettoyerValeur_(dossierSpecifique)
+      : nettoyerValeur_(ressources.DOSSIER_DRIVE_ID),
+    NOM_EXPEDITEUR: nettoyerValeur_(nomExpediteurSpecifique) ||
+      nettoyerValeur_(ressources.NOM_EXPEDITEUR) ||
+      ("Admissions " + ecole),
+    REPLY_TO: nettoyerValeur_(replyToSpecifique) ||
+      nettoyerValeur_(ressources.REPLY_TO)
+  };
+}
+
+function estIdConfigure_(id) {
+  const valeur = nettoyerValeur_(id);
+
+  return Boolean(
+    valeur &&
+    valeur.indexOf("ID_") !== 0 &&
+    valeur.indexOf("A_REMPLACER") === -1 &&
+    valeur.indexOf("A_CONFIGURER") === -1
+  );
+}
+
+function verifierIdConfigure_(id, nomParametre, ecole) {
+  if (!estIdConfigure_(id)) {
+    throw new Error(
+      nomParametre +
+      " n'est pas configuré pour " +
+      ecole +
+      ". Renseignez l'identifiant dans CONFIG.RESSOURCES_ECOLES."
+    );
+  }
+}
+
+function testerModeleAdmissionSelectionne() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const contexte = obtenirContexteSelection_();
+    const ressources = obtenirRessourcesFlux_(
+      contexte.ecole,
+      contexte.typeAdmission
+    );
+
+    verifierIdConfigure_(
+      ressources.TEMPLATE_ID,
+      "TEMPLATE_" + contexte.typeAdmission + "_ID",
+      contexte.ecole
+    );
+    verifierIdConfigure_(
+      ressources.DOSSIER_DRIVE_ID,
+      "DOSSIER_DRIVE_ID",
+      contexte.ecole + " / " + contexte.typeAdmission
+    );
+
+    const fichier = DriveApp.getFileById(ressources.TEMPLATE_ID);
+    const dossier = DriveApp.getFolderById(ressources.DOSSIER_DRIVE_ID);
+
+    if (fichier.getMimeType() !== MimeType.GOOGLE_DOCS) {
+      throw new Error(
+        "Le modèle configuré n'est pas un Google Docs natif : " +
+        fichier.getMimeType()
+      );
+    }
+
+    ui.alert(
+      "Configuration valide",
+      "École : " + contexte.ecole +
+        "\nFlux : " + contexte.typeAdmission +
+        "\nModèle : " + fichier.getName() +
+        "\nDossier : " + dossier.getName() +
+        "\n\nModèle : " + fichier.getUrl() +
+        "\nDossier : " + dossier.getUrl(),
+      ui.ButtonSet.OK
+    );
+  } catch (erreur) {
+    ui.alert("Configuration invalide", erreur.message, ui.ButtonSet.OK);
+  }
+}
+
+function auditerConfigurationModelesAdmissions() {
+  const ui = SpreadsheetApp.getUi();
+  const classeur = SpreadsheetApp.getActiveSpreadsheet();
+  const nomFeuille = "AUDIT_MODELES_ADMISSIONS";
+  let feuille = classeur.getSheetByName(nomFeuille);
+
+  if (!feuille) {
+    feuille = classeur.insertSheet(nomFeuille);
+  }
+
+  const lignes = [[
+    "DATE AUDIT",
+    "ECOLE",
+    "FLUX",
+    "ID MODELE",
+    "STATUT MODELE",
+    "NOM MODELE",
+    "ID DOSSIER",
+    "STATUT DOSSIER",
+    "NOM DOSSIER",
+    "EXPEDITEUR",
+    "REPLY TO"
+  ]];
+
+  const maintenant = formaterDate_(new Date());
+  let erreurs = 0;
+  let valides = 0;
+
+  Object.keys(CONFIG.RESSOURCES_ECOLES).sort().forEach(function(ecole) {
+    ["NATIONAL", "INTERNATIONAL"].forEach(function(flux) {
+      const ressources = obtenirRessourcesFlux_(ecole, flux);
+      let statutModele = "A CONFIGURER";
+      let nomModele = "";
+      let statutDossier = "A CONFIGURER";
+      let nomDossier = "";
+
+      if (estIdConfigure_(ressources.TEMPLATE_ID)) {
+        try {
+          const fichier = DriveApp.getFileById(ressources.TEMPLATE_ID);
+          nomModele = fichier.getName();
+          statutModele = fichier.getMimeType() === MimeType.GOOGLE_DOCS
+            ? "OK"
+            : "ERREUR : PAS UN GOOGLE DOCS";
+        } catch (erreurModele) {
+          statutModele = "ERREUR : " + erreurModele.message;
+        }
+      }
+
+      if (estIdConfigure_(ressources.DOSSIER_DRIVE_ID)) {
+        try {
+          const dossier = DriveApp.getFolderById(ressources.DOSSIER_DRIVE_ID);
+          nomDossier = dossier.getName();
+          statutDossier = "OK";
+        } catch (erreurDossier) {
+          statutDossier = "ERREUR : " + erreurDossier.message;
+        }
+      }
+
+      const ligneValide = statutModele === "OK" && statutDossier === "OK";
+      if (ligneValide) valides++;
+      else erreurs++;
+
+      lignes.push([
+        maintenant,
+        ecole,
+        flux,
+        ressources.TEMPLATE_ID,
+        statutModele,
+        nomModele,
+        ressources.DOSSIER_DRIVE_ID,
+        statutDossier,
+        nomDossier,
+        ressources.NOM_EXPEDITEUR,
+        ressources.REPLY_TO
+      ]);
+    });
+  });
+
+  feuille.clearContents();
+  feuille.getRange(1, 1, lignes.length, lignes[0].length).setValues(lignes);
+  feuille.setFrozenRows(1);
+  feuille.autoResizeColumns(1, lignes[0].length);
+  feuille.getRange(1, 1, 1, lignes[0].length)
+    .setFontWeight("bold")
+    .setBackground("#1f4e78")
+    .setFontColor("#ffffff");
+
+  ui.alert(
+    "Audit terminé",
+    "Configurations valides : " + valides +
+      "\nConfigurations à corriger : " + erreurs +
+      "\n\nConsultez l'onglet " + nomFeuille + ".",
+    ui.ButtonSet.OK
+  );
+}
+
+function formaterDateSimple_(valeur) {
+  if (!valeur) return "";
+
+  if (Object.prototype.toString.call(valeur) === "[object Date]") {
+    return Utilities.formatDate(
+      valeur,
+      CONFIG.FUSEAU_HORAIRE,
+      "dd/MM/yyyy"
+    );
+  }
+
+  const texte = nettoyerValeur_(valeur);
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(texte)) {
+    const parties = texte.split("-");
+    return parties[2] + "/" + parties[1] + "/" + parties[0];
+  }
+
+  return texte;
+}
+
+function remplacerVariablesTexte_(modele, variables) {
+  let resultat = nettoyerValeur_(modele);
+
+  Object.keys(variables).forEach(function(cle) {
+    const motif = new RegExp(
+      echapperExpressionReguliere_("{{" + cle + "}}"),
+      "g"
+    );
+    resultat = resultat.replace(motif, nettoyerValeur_(variables[cle]));
+  });
+
+  return resultat;
+}
+
+function echapperExpressionReguliere_(texte) {
+  return String(texte).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function echapperHtml_(texte) {
+  return nettoyerValeur_(texte)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
